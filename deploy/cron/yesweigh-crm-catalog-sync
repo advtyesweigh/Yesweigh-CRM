@@ -1,0 +1,7 @@
+# YesWeigh CRM — Firebase catalog sync (products + stock)
+# Mon–Fri every hour, Asia/Kolkata. Skip Sat/Sun. No holiday calendar.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CRON_TZ=Asia/Kolkata
+
+0 * * * 1-5 root /opt/yesweigh-crm/scripts/run_catalog_sync_cron.sh

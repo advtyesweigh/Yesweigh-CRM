@@ -1,0 +1,14 @@
+[Unit]
+Description=YesWeigh CRM VPS host agent (ClamAV + app metrics)
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/yesweigh-crm/scripts/vps_host_agent.py
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target

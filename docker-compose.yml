@@ -1,0 +1,57 @@
+services:
+  migrate:
+    build: ./backend
+    container_name: yesweigh-crm-migrate
+    env_file: .env
+    command: ["python", "-m", "app.migrate"]
+    networks:
+      - evolution_net
+    restart: "no"
+
+  api:
+    build: ./backend
+    container_name: yesweigh-crm-api
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:8100:8100"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - employee_docs:/data/employee-docs
+      - wa_media:/data/wa-media
+      - catalog_images:/data/catalog-images
+      - /var/run/yesweigh-vps-agent.sock:/var/run/yesweigh-vps-agent.sock
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - evolution_net
+      - crm_net
+    mem_limit: 512m
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: ""
+    container_name: yesweigh-crm-web
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8101:80"
+    depends_on:
+      - api
+    networks:
+      - crm_net
+    mem_limit: 128m
+
+volumes:
+  employee_docs:
+  wa_media:
+  catalog_images:
+
+networks:
+  evolution_net:
+    external: true
+  crm_net:
+    driver: bridge
