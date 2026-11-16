@@ -1,10 +1,16 @@
 .env
+.env.*
+!.env.example
 .venv/
 __pycache__/
 node_modules/
 dist/
 .DS_Store
 *.db
+*.db-*
+*.bak
+*.bak-*
+data/
 secrets/*
 !secrets/.gitkeep
 frontend/android/
