@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     firebase_email: str = ""
     firebase_password: str = ""
     catalog_image_dir: str = "/data/catalog-images"
+    # Google Places enrichment (server-side only — never expose to frontend / git).
+    google_maps_api_key: str = ""
+    google_places_api_key: str = ""
+
 
 
 @lru_cache
