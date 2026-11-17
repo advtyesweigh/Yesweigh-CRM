@@ -31,9 +31,26 @@ class LeadIn(BaseModel):
     city: str = ""
     district: str = ""
     state: str = ""
+    pin: str = ""
     source: str = "manual"
     status: str = "new"
     notes: str = ""
+
+
+class LeadUpdate(BaseModel):
+    """Partial update for PATCH /api/leads/{id} — only set fields are applied."""
+
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    company: Optional[str] = None
+    city: Optional[str] = None
+    district: Optional[str] = None
+    state: Optional[str] = None
+    pin: Optional[str] = None
+    source: Optional[str] = None
+    status: Optional[str] = None
+    notes: Optional[str] = None
 
 
 class LeadOut(LeadIn):

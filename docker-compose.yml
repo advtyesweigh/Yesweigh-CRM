@@ -21,6 +21,7 @@ services:
       - employee_docs:/data/employee-docs
       - wa_media:/data/wa-media
       - catalog_images:/data/catalog-images
+      - ai_generated_tools:/data/ai-generated-tools
       - /var/run/yesweigh-vps-agent.sock:/var/run/yesweigh-vps-agent.sock
     depends_on:
       migrate:
@@ -49,6 +50,7 @@ volumes:
   employee_docs:
   wa_media:
   catalog_images:
+  ai_generated_tools:
 
 networks:
   evolution_net:

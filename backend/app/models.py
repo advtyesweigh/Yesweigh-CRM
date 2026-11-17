@@ -8,6 +8,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
@@ -43,6 +44,7 @@ class Lead(Base):
     city: Mapped[str] = mapped_column(String(80), default="")
     district: Mapped[str] = mapped_column(String(80), default="")
     state: Mapped[str] = mapped_column(String(80), default="")
+    pin: Mapped[str] = mapped_column(String(20), default="")
     source: Mapped[str] = mapped_column(String(80), default="manual")
     status: Mapped[str] = mapped_column(String(40), default="new")
     notes: Mapped[str] = mapped_column(Text, default="")
@@ -203,6 +205,8 @@ class WhatsAppInstance(Base):
     profile_name: Mapped[str] = mapped_column(String(160), default="")
     profile_photo: Mapped[str] = mapped_column(String(500), default="")
     integration_type: Mapped[str] = mapped_column(String(80), default="WhatsApp Web / Baileys")
+    # evolution = Evolution GO personal phones; meta_cloud = YesOne Meta Cloud API (Care)
+    provider: Mapped[str] = mapped_column(String(40), default="evolution", index=True)
     department: Mapped[str] = mapped_column(String(80), default="")
     branch: Mapped[str] = mapped_column(String(120), default="")
     purpose: Mapped[str] = mapped_column(String(80), default="General Communication")
@@ -211,6 +215,10 @@ class WhatsAppInstance(Base):
     registration_status: Mapped[str] = mapped_column(String(60), default="pending")
     created_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     last_connected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    history_sync_status: Mapped[str] = mapped_column(String(40), default="")
+    history_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    history_sync_stats: Mapped[str] = mapped_column(Text, default="")
+    history_sync_error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -266,6 +274,15 @@ class EvolutionWebhookEvent(Base):
 
 class WhatsAppConversation(Base):
     __tablename__ = "whatsapp_conversations"
+    __table_args__ = (
+        # Speeds inbox list filtered by account chip (instance_id) + recent sort
+        Index(
+            "ix_wa_conv_org_instance_last_msg",
+            "organization_id",
+            "whatsapp_instance_id",
+            "last_message_at",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     public_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
@@ -275,6 +292,8 @@ class WhatsAppConversation(Base):
     customer_name: Mapped[str] = mapped_column(String(160), default="")
     customer_photo: Mapped[str] = mapped_column(Text, default="")
     customer_jid: Mapped[str] = mapped_column(String(120), default="", index=True)
+    # WhatsApp LID (Linked ID) digits — maps @lid chats to the canonical PN conversation.
+    customer_lid: Mapped[str] = mapped_column(String(40), default="", index=True)
     status: Mapped[str] = mapped_column(String(40), default="Open", index=True)
     priority: Mapped[str] = mapped_column(String(40), default="")
     tag: Mapped[str] = mapped_column(String(80), default="")
@@ -286,7 +305,13 @@ class WhatsAppConversation(Base):
     language: Mapped[str] = mapped_column(String(40), default="")
     region: Mapped[str] = mapped_column(String(120), default="")
     customer_type: Mapped[str] = mapped_column(String(40), default="Customer")
+    # Optional link to CRM dealer master (phone match or manual link).
+    dealer_id: Mapped[int | None] = mapped_column(ForeignKey("dealers.id"), nullable=True, index=True)
     notes_summary: Mapped[str] = mapped_column(Text, default="")
+    # Cached Gemini quick outline for the open chat (text + STT transcripts).
+    ai_outline: Mapped[str] = mapped_column(Text, default="")
+    ai_outline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ai_outline_fingerprint: Mapped[str] = mapped_column(String(80), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -306,6 +331,11 @@ class WhatsAppMessage(Base):
     media_url: Mapped[str] = mapped_column(Text, default="")
     media_type: Mapped[str] = mapped_column(String(80), default="")
     media_name: Mapped[str] = mapped_column(String(255), default="")
+    # Sarvam STT — voice/ptt/audio only; body stays the media placeholder.
+    transcript: Mapped[str] = mapped_column(Text, default="")
+    transcript_language: Mapped[str] = mapped_column(String(40), default="")
+    transcription_status: Mapped[str] = mapped_column(String(40), default="")  # pending|processing|completed|failed
+    transcription_error: Mapped[str] = mapped_column(String(255), default="")
     external_message_id: Mapped[str] = mapped_column(String(160), default="", index=True)
     client_message_id: Mapped[str] = mapped_column(String(80), default="", index=True)
     status: Mapped[str] = mapped_column(String(40), default="sent")  # queued|sending|sent|delivered|read|failed
@@ -612,3 +642,156 @@ class CatalogProduct(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+# ---------------------------------------------------------------------------
+# AI Agent (Phase 1 foundation)
+# ---------------------------------------------------------------------------
+
+
+class AiSettings(Base):
+    """Org-level AI toggles/budgets. API key stays in env only."""
+
+    __tablename__ = "ai_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    organization_id: Mapped[str] = mapped_column(String(80), default="yesweigh", unique=True, index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    provider: Mapped[str] = mapped_column(String(40), default="gemini")
+    model: Mapped[str] = mapped_column(String(80), default="gemini-3.5-flash-lite")
+    monthly_budget_inr: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=Decimal("500.00"))
+    daily_budget_inr: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=Decimal("25.00"))
+    max_output_tokens: Mapped[int] = mapped_column(Integer, default=2048)
+    reserved_daily_inr: Mapped[Decimal] = mapped_column(Numeric(12, 4), default=Decimal("0"))
+    reserved_monthly_inr: Mapped[Decimal] = mapped_column(Numeric(12, 4), default=Decimal("0"))
+    updated_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AiSession(Base):
+    __tablename__ = "ai_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    organization_id: Mapped[str] = mapped_column(String(80), default="yesweigh", index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    employee_id: Mapped[int | None] = mapped_column(ForeignKey("employees.id"), nullable=True)
+    title: Mapped[str] = mapped_column(String(200), default="")
+    status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AiMessage(Base):
+    __tablename__ = "ai_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("ai_sessions.id", ondelete="CASCADE"), index=True)
+    run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("ai_agent_runs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    role: Mapped[str] = mapped_column(String(40))  # user | assistant | system | tool
+    content: Mapped[str] = mapped_column(Text, default="")
+    tool_name: Mapped[str] = mapped_column(String(80), default="")
+    meta_json: Mapped[str] = mapped_column(Text, default="")
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AiAgentRun(Base):
+    __tablename__ = "ai_agent_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    organization_id: Mapped[str] = mapped_column(String(80), default="yesweigh", index=True)
+    session_id: Mapped[int | None] = mapped_column(ForeignKey("ai_sessions.id"), nullable=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    employee_id: Mapped[int | None] = mapped_column(ForeignKey("employees.id"), nullable=True)
+    command: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(40), default="queued", index=True)
+    provider: Mapped[str] = mapped_column(String(40), default="")
+    model: Mapped[str] = mapped_column(String(80), default="")
+    result_summary: Mapped[str] = mapped_column(Text, default="")
+    events_json: Mapped[str] = mapped_column(Text, default="[]")
+    error: Mapped[str] = mapped_column(Text, default="")
+    # Soft-hide chat bubbles (per-message ⋮ Delete on /work). Both true → omit run from thread.
+    user_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+    assistant_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AiToolCall(Base):
+    __tablename__ = "ai_tool_calls"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("ai_agent_runs.id", ondelete="CASCADE"), index=True)
+    tool_name: Mapped[str] = mapped_column(String(80), index=True)
+    args_json: Mapped[str] = mapped_column(Text, default="{}")
+    result_json: Mapped[str] = mapped_column(Text, default="")
+    success: Mapped[bool] = mapped_column(Boolean, default=True)
+    error: Mapped[str] = mapped_column(Text, default="")
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AiKnowledge(Base):
+    """Learned glossary: aliases, abbreviations, machine short names, report types, facts."""
+
+    __tablename__ = "ai_knowledge"
+    __table_args__ = (
+        Index("ix_ai_knowledge_org_kind_key", "organization_id", "kind", "key"),
+        Index("ix_ai_knowledge_org_updated", "organization_id", "updated_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    organization_id: Mapped[str] = mapped_column(String(80), default="yesweigh", index=True)
+    # alias | abbreviation | report_type | machine_short_name | fact
+    kind: Mapped[str] = mapped_column(String(40), default="fact", index=True)
+    key: Mapped[str] = mapped_column(String(120), default="")
+    value: Mapped[str] = mapped_column(Text, default="")
+    notes: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(String(40), default="chat")  # chat | manual | tool
+    session_id: Mapped[int | None] = mapped_column(
+        ForeignKey("ai_sessions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("ai_agent_runs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AiUsageLog(Base):
+    __tablename__ = "ai_usage_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    organization_id: Mapped[str] = mapped_column(String(80), default="yesweigh", index=True)
+    run_id: Mapped[int | None] = mapped_column(ForeignKey("ai_agent_runs.id"), nullable=True, index=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    employee_id: Mapped[int | None] = mapped_column(ForeignKey("employees.id"), nullable=True)
+    whatsapp_instance_id: Mapped[int | None] = mapped_column(ForeignKey("whatsapp_instances.id"), nullable=True)
+    conversation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("whatsapp_conversations.id"), nullable=True, index=True
+    )
+    provider: Mapped[str] = mapped_column(String(40), default="")
+    model: Mapped[str] = mapped_column(String(80), default="")
+    purpose: Mapped[str] = mapped_column(String(80), default="command")
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    thoughts_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    estimated_cost_inr: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal("0"))
+    reserved_cost_inr: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal("0"))
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    success: Mapped[bool] = mapped_column(Boolean, default=True)
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)

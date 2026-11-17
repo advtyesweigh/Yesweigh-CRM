@@ -96,6 +96,60 @@ class EvolutionService:
                     await asyncio.sleep(delay_s)
         raise RuntimeError(last_err or "QR not available yet. Click Refresh QR.")
 
+    async def pair(
+        self,
+        instance_token: str,
+        phone: str,
+        *,
+        subscribe: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Request a WhatsApp pairing code via Evolution GO ``POST /instance/pair``.
+
+        Phone must include country code. Evolution GO expects a leading ``+``
+        (manager UI prepends it). Response field is ``data.PairingCode``.
+        """
+        digits = "".join(c for c in (phone or "") if c.isdigit())
+        if len(digits) < 8:
+            raise RuntimeError("Enter a valid phone number with country code")
+        e164 = phone.strip() if (phone or "").strip().startswith("+") else f"+{digits}"
+        body = {
+            "phone": e164,
+            "subscribe": subscribe
+            or [
+                "MESSAGE",
+                "SEND_MESSAGE",
+                "CONNECTION",
+                "QRCODE",
+                "CONTACT",
+                "READ_RECEIPT",
+                "PRESENCE",
+            ],
+        }
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            r = await client.post(
+                f"{self.base_url}/instance/pair",
+                headers=self._headers(instance_token),
+                json=body,
+            )
+            data = r.json() if r.content else {}
+            if not r.is_success:
+                raise RuntimeError(data.get("error") or data.get("message") or r.text or "Pairing failed")
+            payload = data.get("data") if isinstance(data, dict) and "data" in data else data
+            code = ""
+            if isinstance(payload, dict):
+                code = str(
+                    payload.get("PairingCode")
+                    or payload.get("pairingCode")
+                    or payload.get("pairing_code")
+                    or payload.get("code")
+                    or ""
+                ).strip()
+            elif payload is not None:
+                code = str(payload).strip()
+            if not code:
+                raise RuntimeError("Evolution returned no pairing code")
+            return {"pairing_code": code, "phone": e164, "raw": data}
+
     async def status(self, instance_token: str) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(f"{self.base_url}/instance/status", headers=self._headers(instance_token))
@@ -178,10 +232,13 @@ class EvolutionService:
             return data
 
     async def get_avatar(self, instance_token: str, number: str, preview: bool = True) -> dict[str, Any]:
-        # Prefer LID form — PN @s.whatsapp.net often times out on Evolution GO / WhatsApp
+        # Prefer LID form — PN @s.whatsapp.net often times out on Evolution GO / WhatsApp.
+        # Groups/channels must use their JID as-is (LID lookup hangs / is invalid).
+        low = (number or "").lower()
+        is_collective = "@g.us" in low or "@newsletter" in low
         candidates = [number]
         digits = "".join(c for c in (number or "") if c.isdigit())
-        if digits and not str(number).endswith("@lid"):
+        if digits and not str(number).endswith("@lid") and not is_collective:
             try:
                 checked = await self.check_user(instance_token, [digits])
                 users = []
@@ -287,4 +344,133 @@ class EvolutionService:
             data = r.json() if r.content else {}
             if not r.is_success:
                 raise RuntimeError(data.get("message") or data.get("error") or r.text or "Media download failed")
+            return data
+
+    async def get_contacts(self, instance_token: str) -> dict[str, Any]:
+        """GET /user/contacts — WhatsApp address book for the logged-in device."""
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            r = await client.get(
+                f"{self.base_url}/user/contacts",
+                headers=self._headers(instance_token),
+            )
+            data = r.json() if r.content else {}
+            if not r.is_success:
+                raise RuntimeError(data.get("message") or data.get("error") or r.text or "Contacts failed")
+            return data
+
+    async def list_groups(self, instance_token: str) -> dict[str, Any]:
+        """List groups for the device.
+
+        Evolution GO: ``GET /group/list`` returns membership (Name/JID).
+        ``GET /group/myall`` is often empty — fall back to it only if list fails.
+        """
+        last_err: Exception | None = None
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            for path in ("/group/list", "/group/myall"):
+                try:
+                    r = await client.get(
+                        f"{self.base_url}{path}",
+                        headers=self._headers(instance_token),
+                    )
+                    data = r.json() if r.content else {}
+                    if r.is_success:
+                        return data if isinstance(data, dict) else {"data": data}
+                    last_err = RuntimeError(
+                        data.get("message") or data.get("error") or r.text or f"{path} failed"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    last_err = exc
+        raise RuntimeError(str(last_err) if last_err else "Group list failed")
+
+    async def get_group_info(self, instance_token: str, group_jid: str) -> dict[str, Any]:
+        """POST /group/info — subject/metadata for one ``@g.us`` group."""
+        jid = (group_jid or "").strip()
+        if "@" not in jid:
+            digits = "".join(c for c in jid if c.isdigit())
+            jid = f"{digits}@g.us" if digits else jid
+        if "@" not in jid:
+            raise RuntimeError(f"Invalid group jid: {group_jid}")
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                f"{self.base_url}/group/info",
+                headers=self._headers(instance_token),
+                json={"groupJid": jid},
+            )
+            data = r.json() if r.content else {}
+            if not r.is_success:
+                raise RuntimeError(data.get("message") or data.get("error") or r.text or "Group info failed")
+            return data if isinstance(data, dict) else {"data": data}
+
+    async def get_newsletter_info(self, instance_token: str, newsletter_jid: str) -> dict[str, Any]:
+        """POST /newsletter/info — channel name / picture metadata."""
+        jid = (newsletter_jid or "").strip()
+        if "@" not in jid:
+            digits = "".join(c for c in jid if c.isdigit())
+            jid = f"{digits}@newsletter" if digits else jid
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                f"{self.base_url}/newsletter/info",
+                headers=self._headers(instance_token),
+                json={"jid": jid},
+            )
+            data = r.json() if r.content else {}
+            if not r.is_success:
+                raise RuntimeError(data.get("message") or data.get("error") or r.text or "Newsletter info failed")
+            return data
+
+    async def list_newsletters(self, instance_token: str) -> dict[str, Any]:
+        """GET /newsletter/list — channels the device follows (best-effort)."""
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.get(
+                f"{self.base_url}/newsletter/list",
+                headers=self._headers(instance_token),
+            )
+            data = r.json() if r.content else {}
+            if not r.is_success:
+                raise RuntimeError(data.get("message") or data.get("error") or r.text or "Newsletter list failed")
+            return data
+
+    async def request_history_sync(
+        self,
+        instance_token: str,
+        chat_jid: str,
+        *,
+        count: int = 50,
+        message_id: str | None = None,
+        is_from_me: bool | None = None,
+    ) -> dict[str, Any]:
+        """POST /chat/history-sync — ask primary phone for older messages in one chat.
+
+        Evolution GO expects ``messageInfo.chat`` as a JID **string**
+        (e.g. ``9199…@s.whatsapp.net``). Passing ``{user, server}`` objects fails
+        unmarshalling (``Chat of type types.JID``). Message bodies are not returned
+        here — WhatsApp delivers them later as MESSAGE webhooks.
+        """
+        jid = (chat_jid or "").strip()
+        if "@" not in jid:
+            digits = "".join(c for c in jid if c.isdigit())
+            if not digits:
+                raise RuntimeError(f"Invalid chat jid: {chat_jid}")
+            jid = f"{digits}@s.whatsapp.net"
+        else:
+            user, _, server = jid.partition("@")
+            user = user.split(":")[0]
+            if not user or not server:
+                raise RuntimeError(f"Invalid chat jid: {chat_jid}")
+            jid = f"{user}@{server}"
+        message_info: dict[str, Any] = {"chat": jid}
+        if message_id:
+            message_info["id"] = message_id
+        if is_from_me is not None:
+            message_info["isFromMe"] = is_from_me
+        body = {"count": max(1, min(int(count), 200)), "messageInfo": message_info}
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            r = await client.post(
+                f"{self.base_url}/chat/history-sync",
+                headers=self._headers(instance_token),
+                json=body,
+            )
+            data = r.json() if r.content else {}
+            if not r.is_success:
+                raise RuntimeError(data.get("message") or data.get("error") or r.text or "History sync failed")
             return data

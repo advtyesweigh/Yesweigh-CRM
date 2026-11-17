@@ -571,7 +571,7 @@ export default function Dashboard() {
         ] = await Promise.all([
           api<DashboardOut>("/api/dashboard"),
           api<LeadPage>("/api/leads?page=1&page_size=1"),
-          api<{ metrics: WaMetrics }>("/api/whatsapp/conversations?page=1&page_size=1").catch(() => null),
+          api<{ metrics: WaMetrics }>("/api/whatsapp/conversations?limit=1").catch(() => null),
           api<AdmsDaily>(
             `/api/integrations/adms/daily?date_from=${today}&date_to=${today}&page=1&page_size=200`
           ).catch(() => null),
@@ -658,7 +658,7 @@ export default function Dashboard() {
       key: "wa",
       title: "No Reply WhatsApp",
       value: fmtNum(unreadWa),
-      sub: unreadWa > 0 ? "Unread inbox threads" : "All clear",
+      sub: unreadWa > 0 ? "Unread messages from phone" : "All clear",
       tone: unreadWa > 0 ? ("neg" as const) : ("pos" as const),
       icon: "WA",
       iconClass: "green",

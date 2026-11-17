@@ -26,6 +26,8 @@ Central staff master under **Settings → Employees** (profile `/employees/:id`)
 
 **Settings → Evolution API**. CRM owns only instances registered in `whatsapp_instances` (org `yesweigh`). Never list raw Evolution `/instance/all`. Adapter talks to Evolution GO (`/instance/create|connect|qr|status|delete`). Webhooks: `/api/webhooks/evolution/{public_id}`.
 
+**History sync (on LoggedIn + manual Sync history):** Evolution GO has no `findMessages` dump API. CRM calls `GET /user/contacts`, optionally `GET /group/myall`, and `POST /chat/history-sync` per chat with `messageInfo.chat` as a **JID string**. Message bodies arrive as MESSAGE webhooks and are upserted into `whatsapp_conversations` / `whatsapp_messages` for that instance only (media auto-downloaded to `/data/wa-media`). Opening an empty thread also POSTs `/api/whatsapp/conversations/{id}/sync-history`. WhatsApp typically shares only recent linked-device history (not multi-year archives); on-demand requests need a Signal session and may partially fail. Profile DPs use `/user/avatar` (soft-fail → initials).
+
 ## Visual reference
 
 Primary UI reference: `docs/prototypes/yesweigh-crm.html`

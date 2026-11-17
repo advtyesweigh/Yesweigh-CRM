@@ -18,7 +18,7 @@ type AdmsHealth = {
   } | null;
 };
 
-const POLL_MS = 45_000;
+const POLL_MS = 15_000;
 const IST = "Asia/Kolkata";
 
 type Props = {

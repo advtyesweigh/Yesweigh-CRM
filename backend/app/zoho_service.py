@@ -408,6 +408,7 @@ async def upsert_dealer_from_contact(
     contact: dict[str, Any],
     *,
     event_type: str = "",
+    source: str = "zoho",
 ) -> ZohoDealer:
     cid = str(contact.get("contact_id") or contact.get("customer_id") or "")
     if not cid:
@@ -418,6 +419,7 @@ async def upsert_dealer_from_contact(
     contact_name = str(contact.get("contact_name") or contact.get("customer_name") or "")
     company_name = str(contact.get("company_name") or "")
     excluded = is_excluded_contact(contact, name=contact_name, company=company_name, zoho_id=cid)
+    dealer_source = (source or "zoho").strip() or "zoho"
 
     staging = (
         await db.execute(select(ZohoDealer).where(ZohoDealer.zoho_contact_id == cid))
@@ -448,9 +450,15 @@ async def upsert_dealer_from_contact(
             await db.execute(select(Dealer).where(Dealer.zoho_contact_id == cid))
         ).scalar_one_or_none()
         if dealer:
-            await db.delete(dealer)
-            await db.flush()
+            # Clear FK refs before delete (zoho_dealers.dealer_id → dealers.id).
+            linked = (
+                await db.execute(select(ZohoDealer).where(ZohoDealer.dealer_id == dealer.id))
+            ).scalars().all()
+            for z in linked:
+                z.dealer_id = None
             row.dealer_id = None
+            await db.flush()
+            await db.delete(dealer)
             await db.flush()
         return row
 
@@ -466,7 +474,7 @@ async def upsert_dealer_from_contact(
         if not dealer and row.email:
             dealer = (await db.execute(q.where(Dealer.email == row.email))).scalar_one_or_none()
     if not dealer:
-        dealer = Dealer(zoho_contact_id=cid, source="zoho")
+        dealer = Dealer(zoho_contact_id=cid, source=dealer_source)
         db.add(dealer)
     dealer.name = row.contact_name or row.company_name or dealer.name
     dealer.company = row.company_name or dealer.company
@@ -476,7 +484,7 @@ async def upsert_dealer_from_contact(
     dealer.state = row.billing_state or dealer.state
     dealer.gstin = row.gst_no or dealer.gstin
     dealer.zoho_contact_id = cid
-    dealer.source = "zoho"
+    dealer.source = dealer_source
     dealer.status = "active" if (row.status or "").lower() not in {"inactive", "deleted", "excluded"} else "inactive"
     await db.flush()
     row.dealer_id = dealer.id
@@ -485,8 +493,12 @@ async def upsert_dealer_from_contact(
 
 
 def _is_delete_event(event_type: str) -> bool:
-    et = (event_type or "").lower()
-    return "delete" in et or et.endswith("_deleted") or et in {"deleted", "contact_delete", "customer_delete"}
+    et = (event_type or "").lower().replace(" ", "_")
+    return (
+        "delete" in et
+        or et.endswith("_deleted")
+        or et in {"deleted", "contact_delete", "customer_delete", "contact_deleted", "customer_deleted"}
+    )
 
 
 async def delete_dealer_from_contact(
@@ -892,17 +904,125 @@ async def sync_recent(
                 db,
                 integ,
                 "/books/v3/contacts",
-                {"page": page, "per_page": per_page, "contact_type": "customer"},
+                {
+                    "page": page,
+                    "per_page": per_page,
+                    "contact_type": "customer",
+                    "sort_column": "last_modified_time",
+                    "sort_order": "D",
+                },
             )
             contacts = data.get("contacts") or []
             for c in contacts:
-                await upsert_dealer_from_contact(db, c)
+                await upsert_dealer_from_contact(db, c, source="zoho")
                 counts["dealers"] += 1
             counts["customer_pages"] = page
             if not (data.get("page_context") or {}).get("has_more_page"):
                 break
+            if not contacts:
+                break
 
     return counts
+
+
+def parse_zoho_webhook_body(raw_body: bytes, content_type: str = "") -> dict[str, Any]:
+    """
+    Normalize Zoho Books / Flow / workflow POST bodies into a dict.
+
+    Accepts JSON, form-urlencoded ``payload=...``, and ``JSONString`` wrappers.
+    Empty probes become {}.
+    """
+    from urllib.parse import parse_qs, unquote_plus
+
+    text = (raw_body or b"").decode("utf-8", errors="replace").strip()
+    if not text:
+        return {}
+
+    ct = (content_type or "").lower()
+
+    def _unwrap(obj: Any) -> dict[str, Any]:
+        if isinstance(obj, list) and obj:
+            first = obj[0]
+            return _unwrap(first) if isinstance(first, (dict, list, str)) else {"data": obj}
+        if not isinstance(obj, dict):
+            return {"data": obj}
+        # Zoho Flow / custom function wrappers
+        for key in ("JSONString", "payload", "body", "data"):
+            nested = obj.get(key)
+            if isinstance(nested, str) and nested.strip():
+                try:
+                    parsed = json.loads(nested)
+                except Exception:  # noqa: BLE001
+                    continue
+                if isinstance(parsed, dict):
+                    merged = dict(parsed)
+                    # Preserve top-level event hints when nested omits them.
+                    for hint in ("event_type", "event", "notification_type", "action", "module", "entity"):
+                        if obj.get(hint) and not merged.get(hint):
+                            merged[hint] = obj[hint]
+                    return _unwrap(merged)
+                if isinstance(parsed, list):
+                    return _unwrap(parsed)
+            if isinstance(nested, dict):
+                merged = dict(nested)
+                for hint in ("event_type", "event", "notification_type", "action", "module", "entity"):
+                    if obj.get(hint) and not merged.get(hint):
+                        merged[hint] = obj[hint]
+                # Only unwrap when nested looks like the real record envelope.
+                if any(
+                    k in merged
+                    for k in (
+                        "contact",
+                        "customer",
+                        "invoice",
+                        "salesorder",
+                        "creditnote",
+                        "contact_id",
+                        "customer_id",
+                        "invoice_id",
+                    )
+                ):
+                    return _unwrap(merged)
+        return obj
+
+    # Prefer JSON when body looks like it.
+    if text.startswith("{") or text.startswith("["):
+        try:
+            return _unwrap(json.loads(text))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Form-urlencoded: payload=<json> or JSONString=<json>
+    if "application/x-www-form-urlencoded" in ct or "=" in text[:64] and not text.startswith("{"):
+        try:
+            qs = parse_qs(text, keep_blank_values=True)
+            for key in ("payload", "JSONString", "data", "body"):
+                vals = qs.get(key) or []
+                if not vals:
+                    continue
+                raw_val = unquote_plus(vals[0] or "").strip()
+                if not raw_val:
+                    return {}
+                try:
+                    return _unwrap(json.loads(raw_val))
+                except Exception:  # noqa: BLE001
+                    return _unwrap({"raw": raw_val})
+            # Fallback: first value that parses as JSON object
+            for vals in qs.values():
+                for v in vals:
+                    v = unquote_plus(v or "").strip()
+                    if v.startswith("{") or v.startswith("["):
+                        try:
+                            return _unwrap(json.loads(v))
+                        except Exception:  # noqa: BLE001
+                            continue
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        return _unwrap(json.loads(text))
+    except Exception:  # noqa: BLE001
+        return {"raw": text}
 
 
 def _infer_module_from_event(event_type: str, module: str) -> str:
@@ -973,6 +1093,16 @@ def normalize_webhook_payload(payload: dict[str, Any]) -> tuple[str, str, str, d
             str(contact.get("contact_id") or contact.get("customer_id") or ""),
             contact,
         )
+    # Rare: contacts array with one record
+    contacts = payload.get("contacts")
+    if isinstance(contacts, list) and contacts and isinstance(contacts[0], dict):
+        c0 = contacts[0]
+        return (
+            "contact",
+            event_type or "contact",
+            str(c0.get("contact_id") or c0.get("customer_id") or ""),
+            c0,
+        )
 
     data = payload.get("data")
     if isinstance(data, dict):
@@ -1002,6 +1132,9 @@ def normalize_webhook_payload(payload: dict[str, Any]) -> tuple[str, str, str, d
 
     module = _infer_module_from_event(event_type, module)
     rid = str(payload.get("id") or payload.get("record_id") or "")
+    # Event hints like contact_add / customer_update with only an id field
+    if module == "contact" and rid:
+        return "contact", event_type or "contact", rid, payload
     return module or "unknown", event_type or "unknown", rid, None if not rid else payload
 
 
@@ -1035,6 +1168,317 @@ async def fetch_books_record(
     except Exception:
         return None
     return None
+
+
+def _vendor_summary(contact: dict[str, Any]) -> dict[str, Any]:
+    """Safe, read-only vendor fields for AI tools (no tokens / raw secrets)."""
+    cid = str(contact.get("contact_id") or contact.get("vendor_id") or "").strip()
+    ba = contact.get("billing_address") if isinstance(contact.get("billing_address"), dict) else {}
+    return {
+        "vendor_id": cid,
+        "contact_id": cid,
+        "contact_name": str(contact.get("contact_name") or "").strip(),
+        "company_name": str(contact.get("company_name") or "").strip(),
+        "email": str(contact.get("email") or "").strip(),
+        "phone": str(contact.get("phone") or "").strip(),
+        "mobile": str(contact.get("mobile") or "").strip(),
+        "gst_no": str(contact.get("gst_no") or contact.get("gstin") or "").strip(),
+        "status": str(contact.get("status") or "").strip(),
+        "contact_type": str(contact.get("contact_type") or "vendor").strip() or "vendor",
+        "currency_code": str(contact.get("currency_code") or "INR").strip() or "INR",
+        "outstanding_payable_amount": contact.get("outstanding_payable_amount"),
+        "unused_credits_payable_amount": contact.get("unused_credits_payable_amount"),
+        "city": str(ba.get("city") or _addr_field(contact, "city") or "").strip(),
+        "state": str(ba.get("state") or _addr_field(contact, "state") or "").strip(),
+        "country": str(ba.get("country") or _addr_field(contact, "country") or "").strip(),
+        "website": str(contact.get("website") or "").strip(),
+        "cf_vendor_code": str(
+            (contact.get("custom_field_hash") or {}).get("cf_vendor_code")
+            if isinstance(contact.get("custom_field_hash"), dict)
+            else ""
+        ).strip(),
+    }
+
+
+def _bill_summary(bill: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "bill_id": str(bill.get("bill_id") or "").strip(),
+        "bill_number": str(bill.get("bill_number") or "").strip(),
+        "date": str(bill.get("date") or "").strip(),
+        "due_date": str(bill.get("due_date") or "").strip(),
+        "status": str(bill.get("status") or "").strip(),
+        "total": bill.get("total"),
+        "balance": bill.get("balance"),
+        "currency_code": str(bill.get("currency_code") or "INR").strip() or "INR",
+        "vendor_id": str(bill.get("vendor_id") or "").strip(),
+        "vendor_name": str(bill.get("vendor_name") or "").strip(),
+        "reference_number": str(bill.get("reference_number") or "").strip(),
+    }
+
+
+def _purchaseorder_summary(po: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "purchaseorder_id": str(po.get("purchaseorder_id") or "").strip(),
+        "purchaseorder_number": str(po.get("purchaseorder_number") or "").strip(),
+        "date": str(po.get("date") or "").strip(),
+        "delivery_date": str(po.get("delivery_date") or "").strip(),
+        "status": str(po.get("status") or "").strip(),
+        "total": po.get("total"),
+        "currency_code": str(po.get("currency_code") or "INR").strip() or "INR",
+        "vendor_id": str(po.get("vendor_id") or "").strip(),
+        "vendor_name": str(po.get("vendor_name") or "").strip(),
+        "reference_number": str(po.get("reference_number") or "").strip(),
+    }
+
+
+def _vendor_payment_summary(pay: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "payment_id": str(pay.get("payment_id") or "").strip(),
+        "payment_number": str(pay.get("payment_number") or "").strip(),
+        "date": str(pay.get("date") or "").strip(),
+        "amount": pay.get("amount"),
+        "currency_code": str(pay.get("currency_code") or "INR").strip() or "INR",
+        "vendor_id": str(pay.get("vendor_id") or "").strip(),
+        "vendor_name": str(pay.get("vendor_name") or "").strip(),
+        "payment_mode": str(pay.get("payment_mode") or "").strip(),
+        "reference_number": str(pay.get("reference_number") or "").strip(),
+    }
+
+
+async def require_connected_integration(db: AsyncSession) -> ZohoIntegration:
+    integ = await get_integration(db)
+    if not integ or not (integ.zoho_org_id or "").strip():
+        raise RuntimeError("Zoho Books is not connected — reconnect in Settings → Zoho")
+    if (integ.connection_status or "").lower() not in {"connected", "org_selected", "ready", "ok"}:
+        # Still allow API if tokens exist (status naming varies)
+        if not decrypt_secret(integ.encrypted_refresh_token) and not decrypt_secret(
+            integ.encrypted_access_token
+        ):
+            raise RuntimeError("Zoho Books tokens missing — reconnect in Settings → Zoho")
+    return integ
+
+
+async def search_vendors_live(
+    db: AsyncSession,
+    *,
+    query: str = "",
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Live Zoho Books vendor search (contact_type=vendor). Not synced into Postgres."""
+    integ = await require_connected_integration(db)
+    limit = max(1, min(25, int(limit or 10)))
+    q = (query or "").strip()
+    params: dict[str, Any] = {
+        "contact_type": "vendor",
+        "page": 1,
+        "per_page": limit,
+    }
+    if q:
+        # Zoho Books: search_text matches name/company/email/phone
+        params["search_text"] = q
+    data = await books_get(db, integ, "/books/v3/contacts", params)
+    contacts = data.get("contacts") or []
+    items = [_vendor_summary(c) for c in contacts if isinstance(c, dict)]
+    # Client-side tighten when Zoho search_text is broad
+    if q and items:
+        ql = q.casefold()
+        scored: list[tuple[int, dict[str, Any]]] = []
+        for it in items:
+            blob = " ".join(
+                [
+                    it.get("contact_name") or "",
+                    it.get("company_name") or "",
+                    it.get("email") or "",
+                    it.get("gst_no") or "",
+                ]
+            ).casefold()
+            score = 0
+            if ql == (it.get("company_name") or "").casefold() or ql == (it.get("contact_name") or "").casefold():
+                score = 100
+            elif blob.startswith(ql) or ql in blob:
+                score = 70
+            elif any(tok and tok in blob for tok in ql.split() if len(tok) >= 2):
+                score = 40
+            if score:
+                scored.append((score, it))
+        scored.sort(key=lambda x: (-x[0], (x[1].get("company_name") or "").casefold()))
+        items = [it for _, it in scored][:limit]
+    return {
+        "ok": True,
+        "source": "zoho_api",
+        "query": q,
+        "count": len(items),
+        "items": items,
+        "note": "Live Zoho Books vendors (not stored in CRM Postgres).",
+    }
+
+
+async def get_vendor_live(
+    db: AsyncSession,
+    *,
+    vendor_id: str = "",
+    query: str = "",
+) -> dict[str, Any]:
+    """Fetch one vendor from Zoho by id, or resolve unique search match."""
+    integ = await require_connected_integration(db)
+    vid = (vendor_id or "").strip()
+    if not vid and (query or "").strip():
+        searched = await search_vendors_live(db, query=query, limit=10)
+        items = searched.get("items") or []
+        if len(items) == 1:
+            vid = str(items[0].get("vendor_id") or "").strip()
+        elif not items:
+            return {
+                "ok": False,
+                "source": "zoho_api",
+                "resolved": False,
+                "error": "No vendors matched",
+                "query": (query or "").strip(),
+                "candidates": [],
+            }
+        else:
+            return {
+                "ok": True,
+                "source": "zoho_api",
+                "resolved": False,
+                "query": (query or "").strip(),
+                "candidates": items,
+                "note": "Multiple vendors matched — pass vendor_id to get_vendor.",
+            }
+    if not vid:
+        return {"ok": False, "source": "zoho_api", "error": "vendor_id or query is required"}
+    data = await books_get(db, integ, f"/books/v3/contacts/{vid}")
+    contact = data.get("contact")
+    if not isinstance(contact, dict):
+        return {"ok": False, "source": "zoho_api", "error": f"Vendor {vid} not found in Zoho"}
+    ctype = str(contact.get("contact_type") or "").lower()
+    if ctype and "vendor" not in ctype and ctype not in {"", "both"}:
+        # Still return the contact but flag type — may be customer looked up by id
+        pass
+    persons = []
+    for p in contact.get("contact_persons") or []:
+        if not isinstance(p, dict):
+            continue
+        persons.append(
+            {
+                "first_name": str(p.get("first_name") or "").strip(),
+                "last_name": str(p.get("last_name") or "").strip(),
+                "email": str(p.get("email") or "").strip(),
+                "phone": str(p.get("phone") or "").strip(),
+                "mobile": str(p.get("mobile") or "").strip(),
+                "is_primary_contact": bool(p.get("is_primary_contact")),
+            }
+        )
+    summary = _vendor_summary(contact)
+    summary["contact_persons"] = persons[:20]
+    summary["billing_address"] = {
+        "address": str((contact.get("billing_address") or {}).get("address") or "").strip()
+        if isinstance(contact.get("billing_address"), dict)
+        else "",
+        "street2": str((contact.get("billing_address") or {}).get("street2") or "").strip()
+        if isinstance(contact.get("billing_address"), dict)
+        else "",
+        "city": summary.get("city") or "",
+        "state": summary.get("state") or "",
+        "zip": str((contact.get("billing_address") or {}).get("zip") or "").strip()
+        if isinstance(contact.get("billing_address"), dict)
+        else "",
+        "country": summary.get("country") or "",
+    }
+    return {
+        "ok": True,
+        "source": "zoho_api",
+        "resolved": True,
+        "vendor": summary,
+        "note": "Live Zoho Books vendor detail (read-only).",
+    }
+
+
+async def get_vendor_related_live(
+    db: AsyncSession,
+    *,
+    vendor_id: str = "",
+    query: str = "",
+    include: str = "bills,purchaseorders,payments",
+    limit: int = 15,
+) -> dict[str, Any]:
+    """Live Zoho bills / purchase orders / vendor payments for one vendor."""
+    integ = await require_connected_integration(db)
+    limit = max(1, min(50, int(limit or 15)))
+    vid = (vendor_id or "").strip()
+    vendor_meta: dict[str, Any] | None = None
+    if not vid:
+        got = await get_vendor_live(db, query=query)
+        if not got.get("resolved"):
+            return got
+        vendor_meta = got.get("vendor") if isinstance(got.get("vendor"), dict) else None
+        vid = str((vendor_meta or {}).get("vendor_id") or "").strip()
+    if not vid:
+        return {"ok": False, "source": "zoho_api", "error": "vendor_id or query is required"}
+
+    if vendor_meta is None:
+        try:
+            detail = await get_vendor_live(db, vendor_id=vid)
+            if detail.get("ok") and isinstance(detail.get("vendor"), dict):
+                vendor_meta = detail["vendor"]
+        except Exception:
+            vendor_meta = {"vendor_id": vid}
+
+    want = {p.strip().lower() for p in (include or "").split(",") if p.strip()}
+    if not want:
+        want = {"bills", "purchaseorders", "payments"}
+
+    out: dict[str, Any] = {
+        "ok": True,
+        "source": "zoho_api",
+        "vendor_id": vid,
+        "vendor": vendor_meta,
+        "bills": [],
+        "purchaseorders": [],
+        "payments": [],
+        "errors": {},
+    }
+
+    async def _safe(label: str, path: str, key: str, summarizer):
+        try:
+            data = await books_get(
+                db,
+                integ,
+                path,
+                {"vendor_id": vid, "page": 1, "per_page": limit},
+            )
+            rows = data.get(key) or []
+            out[label] = [summarizer(r) for r in rows if isinstance(r, dict)]
+        except Exception as exc:  # noqa: BLE001
+            out["errors"][label] = str(exc)[:300]
+
+    if "bills" in want or "bill" in want:
+        await _safe("bills", "/books/v3/bills", "bills", _bill_summary)
+    if "purchaseorders" in want or "purchaseorder" in want or "po" in want:
+        await _safe(
+            "purchaseorders",
+            "/books/v3/purchaseorders",
+            "purchaseorders",
+            _purchaseorder_summary,
+        )
+    if "payments" in want or "vendorpayments" in want:
+        await _safe(
+            "payments",
+            "/books/v3/vendorpayments",
+            "vendorpayments",
+            _vendor_payment_summary,
+        )
+
+    out["counts"] = {
+        "bills": len(out["bills"]),
+        "purchaseorders": len(out["purchaseorders"]),
+        "payments": len(out["payments"]),
+    }
+    out["note"] = (
+        "Live Zoho Books vendor-related documents (bills / POs / payments). "
+        "Not stored in CRM Postgres."
+    )
+    return out
 
 
 async def process_webhook_event(
@@ -1119,18 +1563,27 @@ async def process_webhook_event(
             action = "creditnote_upsert"
         else:
             action = "creditnote_skipped"
-    elif mod == "contact":
+    elif mod in {"contact", "contacts", "customer", "customers"}:
+        # Live dealer path: webhook create/update/delete → zoho_dealers + dealers.
         if _is_delete_event(et) or (record and str(record.get("status") or "").lower() == "deleted"):
-            await delete_dealer_from_contact(db, record_id or str((record or {}).get("contact_id") or ""), raw=record)
+            await delete_dealer_from_contact(
+                db,
+                record_id or str((record or {}).get("contact_id") or (record or {}).get("customer_id") or ""),
+                raw=record,
+            )
             action = "contact_deleted"
         elif record:
-            await upsert_dealer_from_contact(db, record, event_type=et)
+            await upsert_dealer_from_contact(
+                db, record, event_type=et, source="zoho_webhook"
+            )
             action = "contact_upsert"
         elif record_id:
-            # Minimal create/edit with id only — create stub, then try fetch.
+            # Minimal create/edit with id only — fetch full Books contact when possible.
             stub = {"contact_id": record_id}
             fetched = await fetch_books_record(db, integ, "contact", record_id)
-            await upsert_dealer_from_contact(db, fetched or stub, event_type=et)
+            await upsert_dealer_from_contact(
+                db, fetched or stub, event_type=et, source="zoho_webhook"
+            )
             action = "contact_upsert"
         else:
             action = "contact_skipped"

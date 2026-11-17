@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,6 +31,7 @@ from app.models import (
     WhatsAppInstanceEmployee,
     WhatsAppMessage,
 )
+from app.whatsapp_chat_types import is_group_jid, is_inbox_excluded_jid
 from app.whatsapp_employee_exclusions import is_whatsapp_excluded_employee_code, normalize_code
 
 ORG = "yesweigh"
@@ -38,9 +40,122 @@ Db = Annotated[AsyncSession, Depends(get_db)]
 CurrentUser = Annotated[User, Depends(get_current_user)]
 
 
+async def primary_owner_employee(db: AsyncSession, instance_id: int) -> Employee | None:
+    """WhatsApp instance → linked employee (primary owner, else first active assignee)."""
+    owner = (
+        await db.execute(
+            select(Employee)
+            .join(WhatsAppInstanceEmployee, WhatsAppInstanceEmployee.employee_id == Employee.id)
+            .where(
+                WhatsAppInstanceEmployee.whatsapp_instance_id == instance_id,
+                WhatsAppInstanceEmployee.organization_id == ORG,
+                WhatsAppInstanceEmployee.is_active.is_(True),
+                WhatsAppInstanceEmployee.revoked_at.is_(None),
+                WhatsAppInstanceEmployee.is_primary_owner.is_(True),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if owner:
+        return owner
+    return (
+        await db.execute(
+            select(Employee)
+            .join(WhatsAppInstanceEmployee, WhatsAppInstanceEmployee.employee_id == Employee.id)
+            .where(
+                WhatsAppInstanceEmployee.whatsapp_instance_id == instance_id,
+                WhatsAppInstanceEmployee.organization_id == ORG,
+                WhatsAppInstanceEmployee.is_active.is_(True),
+                WhatsAppInstanceEmployee.revoked_at.is_(None),
+            )
+            .order_by(WhatsAppInstanceEmployee.id.asc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+async def assign_conversation_to_instance_owner(
+    db: AsyncSession, conv: WhatsAppConversation, instance_id: int, *, force: bool = False
+) -> Employee | None:
+    """Default conversation owner = WhatsApp-associated employee. No-op if already assigned unless force."""
+    if conv.assigned_employee_id and not force:
+        return None
+    emp = await primary_owner_employee(db, instance_id)
+    if not emp:
+        return None
+    conv.assigned_employee_id = emp.id
+    if emp.user_id:
+        conv.assigned_user_id = emp.user_id
+    return emp
+
+
+def clear_conversation_unread(conv: WhatsAppConversation) -> bool:
+    """Clear CRM unread + green New badge state. Returns True if anything changed."""
+    changed = False
+    if (conv.unread_count or 0) != 0:
+        conv.unread_count = 0
+        changed = True
+    if conv.status == "New":
+        conv.status = "Open"
+        changed = True
+    if (conv.tag or "").strip().lower() == "new":
+        conv.tag = ""
+        changed = True
+    return changed
+
+
 def _require_admin(user: User) -> None:
     if user.role.lower() not in {"admin", "super_admin", "super admin", "management"}:
         raise HTTPException(403, "Administrator access required")
+
+
+def _delete_password_ok(provided: str, expected: str) -> bool:
+    a = (provided or "").strip()
+    b = (expected or "").strip()
+    if not a or not b or len(a) != len(b):
+        return False
+    return secrets.compare_digest(a, b)
+
+
+def _evolution_logged_in(payload: Any) -> bool:
+    """True only when WhatsApp is paired (QR scanned), not merely socket-up.
+
+    Evolution GO often returns ``Connected: true, LoggedIn: false`` while a QR is
+    still pending. Treating ``Connected`` alone as paired skipped QR display.
+    """
+    if not isinstance(payload, dict):
+        return False
+    if "LoggedIn" in payload or "loggedIn" in payload:
+        return bool(payload.get("LoggedIn") or payload.get("loggedIn"))
+    status = str(payload.get("status") or payload.get("state") or "").strip().lower()
+    if status in {"open", "paired", "authenticated"}:
+        return True
+    jid = str(
+        payload.get("jid")
+        or payload.get("Jid")
+        or payload.get("phone")
+        or payload.get("Phone")
+        or ""
+    )
+    has_device = bool(jid and ("@" in jid or jid.lstrip("+").isdigit()))
+    if has_device and bool(payload.get("connected") or payload.get("Connected")):
+        return True
+    return False
+
+
+def _evolution_phone(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    raw = str(
+        payload.get("jid")
+        or payload.get("Jid")
+        or payload.get("phone")
+        or payload.get("Phone")
+        or ""
+    )
+    if not raw:
+        return ""
+    return raw.split("@")[0].split(":")[0]
 
 
 def _webhook_callback(public_id: str) -> str:
@@ -176,10 +291,26 @@ def _instance_out(inst: WhatsAppInstance, assignees: list[dict[str, Any]] | None
         "connection_status": inst.connection_status,
         "registration_status": inst.registration_status,
         "integration_type": inst.integration_type,
+        "provider": getattr(inst, "provider", None) or "evolution",
         "last_connected_at": inst.last_connected_at,
+        "history_sync_status": getattr(inst, "history_sync_status", "") or "",
+        "history_sync_at": getattr(inst, "history_sync_at", None),
+        "history_sync_error": getattr(inst, "history_sync_error", "") or "",
         "created_at": inst.created_at,
         "assignees": assignees or [],
     }
+
+
+def _maybe_schedule_history_sync(inst: WhatsAppInstance, *, trigger: str, force: bool = False) -> None:
+    """Kick off instance-scoped history sync after LoggedIn (non-blocking)."""
+    if (getattr(inst, "provider", None) or "").strip().lower() == "meta_cloud":
+        return
+    try:
+        from app.whatsapp_history_sync import schedule_history_sync
+
+        schedule_history_sync(inst.id, trigger=trigger, force=force)
+    except Exception as exc:  # noqa: BLE001
+        print(f"history sync schedule failed: {exc}")
 
 
 async def _active_instance_employee_ids(db: AsyncSession) -> set[int]:
@@ -498,6 +629,8 @@ async def update_instance(public_id: str, body: InstanceUpdateIn, db: Db, user: 
 async def connect_instance(public_id: str, db: Db, user: CurrentUser):
     _require_admin(user)
     inst = await _owned_instance(db, public_id)
+    if (inst.provider or "").strip().lower() == "meta_cloud":
+        raise HTTPException(400, "Care Cloud WhatsApp does not use Evolution QR connect")
     _, svc = await _svc(db)
     token = decrypt_secret(inst.encrypted_instance_token)
     await svc.connect(token, _webhook_callback(public_id))
@@ -511,38 +644,40 @@ async def connect_instance(public_id: str, db: Db, user: CurrentUser):
 async def instance_qr(public_id: str, db: Db, user: CurrentUser):
     _require_admin(user)
     inst = await _owned_instance(db, public_id)
+    if (inst.provider or "").strip().lower() == "meta_cloud":
+        raise HTTPException(400, "Care Cloud WhatsApp has no QR code")
     _, svc = await _svc(db)
     token = decrypt_secret(inst.encrypted_instance_token)
     if not token:
         raise HTTPException(400, "Instance token missing")
     try:
-        # If already connected, return status instead of a QR
+        # Only skip QR when WhatsApp is actually paired (LoggedIn), not socket Connected.
         try:
             remote = await svc.status(token)
             payload = remote.get("data") if isinstance(remote, dict) else remote
-            if isinstance(payload, dict) and (
-                payload.get("connected") or payload.get("Connected") or payload.get("LoggedIn")
-            ):
+            if _evolution_logged_in(payload):
+                was_connected = (inst.connection_status or "").lower() == "connected"
                 inst.connection_status = "Connected"
                 inst.last_connected_at = datetime.now(timezone.utc)
-                phone = str(payload.get("jid") or payload.get("phone") or payload.get("Jid") or "")
-                if phone and ("@" in phone or phone.replace("+", "").isdigit()):
-                    inst.connected_phone_number = phone.split("@")[0].split(":")[0]
-                profile_name = str(payload.get("Name") or payload.get("name") or "")
-                if profile_name:
-                    inst.profile_name = profile_name
-                # Prefer jid from instance info when status only returns Name
+                phone = _evolution_phone(payload)
+                if phone:
+                    inst.connected_phone_number = phone
+                if isinstance(payload, dict):
+                    profile_name = str(payload.get("Name") or payload.get("name") or "")
+                    if profile_name:
+                        inst.profile_name = profile_name
                 if not inst.connected_phone_number:
                     try:
                         info = await svc.info(inst.evolution_instance_id, token)
                         info_data = info.get("data") if isinstance(info, dict) else info
-                        if isinstance(info_data, dict):
-                            jid = str(info_data.get("jid") or info_data.get("phone") or "")
-                            if jid:
-                                inst.connected_phone_number = jid.split("@")[0].split(":")[0]
+                        phone = _evolution_phone(info_data)
+                        if phone:
+                            inst.connected_phone_number = phone
                     except Exception:  # noqa: BLE001
                         pass
                 await db.commit()
+                if not was_connected:
+                    _maybe_schedule_history_sync(inst, trigger="qr_logged_in")
                 return {
                     "instance_id": public_id,
                     "display_name": inst.display_name,
@@ -583,6 +718,72 @@ async def instance_qr(public_id: str, db: Db, user: CurrentUser):
         raise HTTPException(409, str(exc)) from exc
 
 
+class PairingCodeBody(BaseModel):
+    phone: str = Field(..., min_length=8, max_length=32)
+
+
+@router.post("/api/whatsapp/instances/{public_id}/pairing-code")
+async def instance_pairing_code(public_id: str, body: PairingCodeBody, db: Db, user: CurrentUser):
+    """Mint a WhatsApp pairing code (link with phone number) via Evolution GO."""
+    _require_admin(user)
+    inst = await _owned_instance(db, public_id)
+    if (inst.provider or "").strip().lower() == "meta_cloud":
+        raise HTTPException(400, "Care Cloud WhatsApp does not use pairing codes")
+    _, svc = await _svc(db)
+    token = decrypt_secret(inst.encrypted_instance_token)
+    if not token:
+        raise HTTPException(400, "Instance token missing")
+    try:
+        remote = await svc.status(token)
+        payload = remote.get("data") if isinstance(remote, dict) else remote
+        if _evolution_logged_in(payload):
+            was_connected = (inst.connection_status or "").lower() == "connected"
+            inst.connection_status = "Connected"
+            inst.last_connected_at = datetime.now(timezone.utc)
+            phone = _evolution_phone(payload)
+            if phone:
+                inst.connected_phone_number = phone
+            await db.commit()
+            if not was_connected:
+                _maybe_schedule_history_sync(inst, trigger="pair_already_logged_in")
+            return {
+                "instance_id": public_id,
+                "display_name": inst.display_name,
+                "connected": True,
+                "connection_status": "Connected",
+                "phone": inst.connected_phone_number or inst.profile_name,
+                "pairing_code": None,
+            }
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Evolution GO manager: connect first, brief wait, then /instance/pair
+    try:
+        await svc.connect(token, _webhook_callback(public_id))
+    except Exception:  # noqa: BLE001
+        pass
+    await asyncio.sleep(1.0)
+    try:
+        result = await svc.pair(token, body.phone)
+        inst.connection_status = "QR Required"
+        if not (inst.expected_phone_number or "").strip():
+            digits = "".join(c for c in body.phone if c.isdigit())
+            if digits:
+                inst.expected_phone_number = digits
+        await _log(db, inst.id, "pairing_code_requested", result.get("phone") or body.phone)
+        await db.commit()
+        return {
+            "instance_id": public_id,
+            "display_name": inst.display_name,
+            "connected": False,
+            "connection_status": "QR Required",
+            "phone": result.get("phone") or body.phone,
+            "pairing_code": result.get("pairing_code"),
+        }
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(409, str(exc)) from exc
+
+
 @router.get("/api/whatsapp/instances/{public_id}/status")
 async def instance_status(public_id: str, db: Db, user: CurrentUser):
     _require_admin(user)
@@ -592,46 +793,36 @@ async def instance_status(public_id: str, db: Db, user: CurrentUser):
     try:
         remote = await svc.status(token)
         payload = remote.get("data") if isinstance(remote, dict) else remote
-        connected = False
-        phone = ""
+        logged_in = _evolution_logged_in(payload)
+        phone = _evolution_phone(payload)
         if isinstance(payload, dict):
-            # Evolution GO returns Connected/LoggedIn (PascalCase) and sometimes lowercase.
-            connected = bool(
-                payload.get("connected")
-                or payload.get("Connected")
-                or payload.get("LoggedIn")
-                or payload.get("loggedIn")
-                or payload.get("status") == "open"
-            )
-            phone = str(
-                payload.get("phone")
-                or payload.get("Phone")
-                or payload.get("jid")
-                or payload.get("Jid")
-                or ""
-            )
             profile_name = str(payload.get("Name") or payload.get("name") or "")
             if profile_name:
                 inst.profile_name = profile_name
-        # Fallback: instance info / all-list when status shape is incomplete
-        if not connected:
+        # Fallback: instance info when status shape is incomplete
+        if not logged_in:
             try:
                 info = await svc.info(inst.evolution_instance_id, token)
                 info_data = info.get("data") if isinstance(info, dict) else info
-                if isinstance(info_data, dict):
-                    connected = bool(info_data.get("connected") or info_data.get("Connected"))
-                    if not phone:
-                        phone = str(info_data.get("jid") or info_data.get("phone") or "")
+                logged_in = _evolution_logged_in(info_data)
+                if not phone:
+                    phone = _evolution_phone(info_data)
             except Exception:  # noqa: BLE001
                 pass
-        if connected:
+        if logged_in:
+            was_connected = (inst.connection_status or "").lower() == "connected"
             inst.connection_status = "Connected"
             inst.last_connected_at = datetime.now(timezone.utc)
             if phone:
-                inst.connected_phone_number = phone.split("@")[0].split(":")[0]
+                inst.connected_phone_number = phone
+            await db.commit()
+            if not was_connected:
+                _maybe_schedule_history_sync(inst, trigger="status_logged_in")
         elif inst.connection_status not in {"Error", "Logged Out"}:
             inst.connection_status = "QR Required"
-        await db.commit()
+            await db.commit()
+        else:
+            await db.commit()
         return {"instance_id": public_id, "connection_status": inst.connection_status, "remote": remote}
     except Exception as exc:  # noqa: BLE001
         inst.connection_status = "Error"
@@ -651,6 +842,25 @@ async def restart_instance(public_id: str, db: Db, user: CurrentUser):
     return {"ok": True}
 
 
+@router.post("/api/whatsapp/instances/{public_id}/sync-history")
+async def sync_instance_history(public_id: str, db: Db, user: CurrentUser):
+    """Manually trigger Evolution contacts + on-demand history sync for one instance."""
+    _require_admin(user)
+    inst = await _owned_instance(db, public_id)
+    if (inst.connection_status or "").lower() != "connected":
+        # Still allow attempt — contacts/history need LoggedIn; surface soft warning
+        pass
+    _maybe_schedule_history_sync(inst, trigger="manual", force=True)
+    await _log(db, inst.id, "history_sync_requested", "manual")
+    await db.commit()
+    return {
+        "ok": True,
+        "instance_id": public_id,
+        "history_sync_status": "running",
+        "note": "Sync started in background. Messages arrive via webhooks as WhatsApp delivers history.",
+    }
+
+
 @router.post("/api/whatsapp/instances/{public_id}/disconnect")
 async def disconnect_instance(public_id: str, db: Db, user: CurrentUser):
     _require_admin(user)
@@ -664,9 +874,23 @@ async def disconnect_instance(public_id: str, db: Db, user: CurrentUser):
     return {"ok": True}
 
 
+class DeleteInstanceBody(BaseModel):
+    password: str = ""
+
+
 @router.delete("/api/whatsapp/instances/{public_id}")
-async def delete_instance(public_id: str, db: Db, user: CurrentUser):
+async def delete_instance(
+    public_id: str,
+    db: Db,
+    user: CurrentUser,
+    body: Annotated[DeleteInstanceBody | None, Body()] = None,
+    x_whatsapp_delete_password: Annotated[str | None, Header()] = None,
+):
     _require_admin(user)
+    expected = get_settings().whatsapp_instance_delete_password or ""
+    provided = (body.password if body else "") or (x_whatsapp_delete_password or "")
+    if not _delete_password_ok(provided, expected):
+        raise HTTPException(403, "Invalid delete password")
     inst = await _owned_instance(db, public_id)
     _, svc = await _svc(db)
     try:
@@ -827,18 +1051,18 @@ async def evolution_webhook(
     )
     lower = event_type.lower()
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-    connected_flag = False
+    logged_in = _evolution_logged_in(data)
     if isinstance(data, dict):
-        connected_flag = bool(data.get("connected") or data.get("Connected") or data.get("LoggedIn"))
-        jid = str(data.get("jid") or data.get("Jid") or data.get("phone") or "")
-        if jid and ("@" in jid or jid.isdigit()):
-            inst.connected_phone_number = jid.split("@")[0].split(":")[0]
-    if connected_flag or "connection" in lower and ("open" in lower or payload.get("connected") is True):
+        phone = _evolution_phone(data)
+        if phone:
+            inst.connected_phone_number = phone
+    # Pairing confirmed: LoggedIn / open with device — not socket Connected alone
+    became_connected = False
+    if logged_in or ("connection" in lower and "open" in lower and bool(_evolution_phone(data))):
+        was_connected = (inst.connection_status or "").lower() == "connected"
         inst.connection_status = "Connected"
         inst.last_connected_at = datetime.now(timezone.utc)
-    elif "connect" in lower or payload.get("connected") is True:
-        inst.connection_status = "Connected"
-        inst.last_connected_at = datetime.now(timezone.utc)
+        became_connected = not was_connected
     if "qr" in lower:
         inst.connection_status = "QR Required"
     if "disconnect" in lower or "logout" in lower:
@@ -864,6 +1088,8 @@ async def evolution_webhook(
             pass
 
     await db.commit()
+    if became_connected:
+        _maybe_schedule_history_sync(inst, trigger="webhook_logged_in")
     return {"ok": True}
 
 
@@ -953,11 +1179,41 @@ def _message_node(payload: dict[str, Any]) -> dict[str, Any] | None:
     if msg is None and isinstance(data.get("message"), dict):
         inner = data["message"]
         msg = inner.get("message") if isinstance(inner.get("message"), dict) else inner
-    return msg if isinstance(msg, dict) else None
+    if not isinstance(msg, dict):
+        return None
+    # Helpers are defined later in this module; resolve at call time.
+    unwrapped = _unwrap_message_body(msg) or msg
+    if unwrapped is msg:
+        return msg
+    # Keep Evolution GO download helpers that sit on the outer envelope.
+    merged = dict(unwrapped)
+    for k in ("base64", "Base64", "mediaUrl", "MediaUrl"):
+        if k in msg and k not in merged:
+            merged[k] = msg[k]
+    return merged
 
 
 def _detect_media(msg: dict[str, Any]) -> tuple[str, dict[str, Any], str, str]:
     """Return (media_type, media_node, filename, mimetype)."""
+    msg = _unwrap_message_body(msg) if isinstance(msg, dict) else msg
+    if not isinstance(msg, dict):
+        return "", {}, "", ""
+
+    # documentWithCaptionMessage nests the real documentMessage
+    nested_doc = msg.get("documentWithCaptionMessage")
+    if isinstance(nested_doc, dict):
+        inner = nested_doc.get("message") if isinstance(nested_doc.get("message"), dict) else nested_doc
+        if isinstance(inner, dict) and isinstance(inner.get("documentMessage"), dict):
+            msg = {**msg, "documentMessage": inner["documentMessage"]}
+
+    # Hydrated template header media (image/video/document title)
+    tm = msg.get("templateMessage")
+    if isinstance(tm, dict):
+        ht = tm.get("hydratedTemplate") or tm.get("hydratedFourRowTemplate") or {}
+        title = ht.get("Title") if isinstance(ht, dict) else None
+        if isinstance(title, dict):
+            msg = {**msg, **{k: title[k] for k in ("imageMessage", "videoMessage", "documentMessage") if k in title}}
+
     mapping = [
         ("image", "imageMessage", "photo.jpg"),
         ("video", "videoMessage", "video.mp4"),
@@ -974,32 +1230,96 @@ def _detect_media(msg: dict[str, Any]) -> tuple[str, dict[str, Any], str, str]:
                 ext = mime.split("/")[-1].split(";")[0]
                 name = f"file.{ext}" if ext else name
             return mtype, node, name, mime
-    info_type = ""
-    return "", {}, "", info_type
+    return "", {}, "", ""
 
 
-async def _persist_inbound_media(
+def _normalize_media_type(raw: str) -> str:
+    """Map Evolution MediaType / aliases onto CRM media_type values."""
+    mt = (raw or "").strip().lower()
+    if mt in {"ptt", "voice", "audiomessage", "pttmessage"}:
+        return "audio"
+    if mt in {"gif", "ptv", "gifmessage"}:
+        return "video"
+    if mt in {"image", "video", "audio", "document", "sticker"}:
+        return mt
+    if mt in {"imagemessage", "videomessage", "documentmessage", "stickermessage"}:
+        return mt.replace("message", "")
+    return ""
+
+
+def _outer_message_node(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Raw Evolution Message envelope (before unwrap) — needed for downloadmedia."""
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if not isinstance(data, dict):
+        return None
+    msg = data.get("Message") if isinstance(data.get("Message"), dict) else None
+    if msg is None and isinstance(data.get("message"), dict):
+        inner = data["message"]
+        msg = inner.get("message") if isinstance(inner.get("message"), dict) else inner
+    return msg if isinstance(msg, dict) else None
+
+
+def _thumbnail_b64(node: dict[str, Any] | None) -> str:
+    if not isinstance(node, dict):
+        return ""
+    for key in ("JPEGThumbnail", "jpegThumbnail", "thumbnail", "Thumbnail"):
+        val = node.get(key)
+        if isinstance(val, str) and len(val) > 80 and not val.startswith("[omitted"):
+            return val
+    return ""
+
+
+async def _persist_message_media(
     svc: EvolutionService,
     token: str,
     payload: dict[str, Any],
 ) -> dict[str, str]:
     """
-    Auto-download inbound media to VPS disk.
-    Prefers webhook base64/mediaUrl; falls back to Evolution /message/downloadmedia.
+    Download inbound or outbound media to VPS disk.
+    Prefers webhook base64/mediaUrl; falls back to Evolution /message/downloadmedia;
+    then JPEGThumbnail so channel/GIF replies still render a preview.
     """
+    import asyncio
+
     msg = _message_node(payload)
     if not msg:
         return {}
     media_type, node, filename, mime = _detect_media(msg)
     if not media_type:
-        # Info.MediaType fallback
         data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
         info = data.get("Info") if isinstance(data.get("Info"), dict) else {}
-        mt = str(info.get("MediaType") or info.get("Type") or "").lower()
-        if mt in {"image", "video", "audio", "document", "sticker"}:
-            media_type = mt
-        else:
+        media_type = _normalize_media_type(str(info.get("MediaType") or ""))
+        if not media_type and str(info.get("Type") or "").lower() == "media":
+            if isinstance(msg.get("videoMessage"), dict):
+                media_type = "video"
+            elif isinstance(msg.get("imageMessage"), dict):
+                media_type = "image"
+            else:
+                media_type = "document"
+        if not media_type:
             return {}
+        filename = {
+            "image": "photo.jpg",
+            "video": "video.mp4",
+            "audio": "voice.ogg",
+            "document": "file",
+            "sticker": "sticker.webp",
+        }.get(media_type, "file")
+
+    if not isinstance(node, dict) or not node:
+        for key in ("imageMessage", "videoMessage", "audioMessage", "documentMessage", "stickerMessage"):
+            if isinstance(msg.get(key), dict):
+                node = msg[key]
+                break
+
+    if isinstance(node, dict) and (
+        node.get("gifPlayback")
+        or str(node.get("mimetype") or node.get("Mimetype") or "").lower().startswith("video/")
+    ):
+        if media_type in {"", "document"}:
+            media_type = "video"
+            if not filename or filename == "file":
+                filename = "video.mp4"
 
     b64 = msg.get("base64") or msg.get("Base64") or ""
     media_url = msg.get("mediaUrl") or msg.get("MediaUrl") or ""
@@ -1014,37 +1334,99 @@ async def _persist_inbound_media(
         elif isinstance(media_url, str) and media_url.startswith(("http://", "https://")):
             import httpx
 
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 r = await client.get(media_url)
                 r.raise_for_status()
                 public, _ = save_bytes(r.content, media_type=media_type or "document", filename=filename)
         elif isinstance(media_url, str) and media_url.startswith("data:"):
             public, _, _ = save_data_url(media_url, media_type=media_type or "document", filename=filename)
         else:
-            # Ask Evolution to decrypt/download using the media node
-            download_msg = {k: v for k, v in msg.items() if k.lower() != "base64"}
-            remote = await svc.download_media(token, download_msg)
-            data = remote.get("data") if isinstance(remote.get("data"), dict) else remote
-            raw = ""
-            if isinstance(data, dict):
-                raw = str(data.get("base64") or data.get("data") or "")
-            elif isinstance(data, str):
-                raw = data
-            if not raw and isinstance(remote.get("base64"), str):
-                raw = remote["base64"]
-            if raw:
-                if not raw.startswith("data:"):
-                    raw = f"data:{mime or 'application/octet-stream'};base64,{raw}"
-                public, _, _ = save_data_url(raw, media_type=media_type or "document", filename=filename)
+            has_decrypt_key = bool(
+                isinstance(node, dict)
+                and (
+                    node.get("mediaKey")
+                    or node.get("MediaKey")
+                    or node.get("fileEncSHA256")
+                    or node.get("FileEncSHA256")
+                )
+            )
+            thumb_early = _thumbnail_b64(node) or _thumbnail_b64(msg)
+            # Channel GIF/replies often omit mediaKey; Evolution downloadmedia can hang.
+            # Prefer thumbnail immediately when we already have one and no decrypt key.
+            if has_decrypt_key or not thumb_early:
+                outer = _outer_message_node(payload) or msg
+                media_key = {
+                    "image": "imageMessage",
+                    "video": "videoMessage",
+                    "audio": "audioMessage",
+                    "document": "documentMessage",
+                    "sticker": "stickerMessage",
+                }.get(media_type or "")
+                minimal = {media_key: node} if media_key and isinstance(node, dict) and node else None
+                candidates: list[dict[str, Any]] = []
+                for cand in (outer, msg, minimal):
+                    if not isinstance(cand, dict):
+                        continue
+                    download_msg = {k: v for k, v in cand.items() if k.lower() != "base64"}
+                    if isinstance(download_msg.get("base64"), str) and str(download_msg.get("base64")).startswith(
+                        "[omitted"
+                    ):
+                        download_msg.pop("base64", None)
+                    if download_msg:
+                        candidates.append(download_msg)
+                for download_msg in candidates:
+                    try:
+                        remote = await asyncio.wait_for(svc.download_media(token, download_msg), timeout=20.0)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"media download attempt failed: {exc}")
+                        continue
+                    data = remote.get("data") if isinstance(remote.get("data"), dict) else remote
+                    raw = ""
+                    if isinstance(data, dict):
+                        raw = str(data.get("base64") or data.get("data") or "")
+                    elif isinstance(data, str):
+                        raw = data
+                    if not raw and isinstance(remote.get("base64"), str):
+                        raw = remote["base64"]
+                    if raw and not raw.startswith("[omitted") and len(raw) > 80:
+                        if not raw.startswith("data:"):
+                            raw = f"data:{mime or 'application/octet-stream'};base64,{raw}"
+                        public, _, _ = save_data_url(raw, media_type=media_type or "document", filename=filename)
+                        break
     except Exception as exc:  # noqa: BLE001
         print(f"media persist failed: {exc}")
-        return {"media_type": media_type, "media_name": filename, "media_url": ""}
+        public = ""
+
+    # Always attempt thumbnail so inbox never keeps empty Photo/Attachment/file bubbles.
+    if not public:
+        thumb = _thumbnail_b64(node) or _thumbnail_b64(msg)
+        if thumb:
+            try:
+                thumb_name = (
+                    filename
+                    if (filename or "").lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+                    else "preview.jpg"
+                )
+                public, _, _ = save_data_url(
+                    thumb if thumb.startswith("data:") else f"data:image/jpeg;base64,{thumb}",
+                    media_type="image",
+                    filename=thumb_name,
+                )
+                media_type = "image"
+                filename = thumb_name
+            except Exception as exc:  # noqa: BLE001
+                print(f"thumbnail persist failed: {exc}")
 
     return {
         "media_type": media_type,
         "media_name": filename,
         "media_url": public,
     }
+
+
+
+# Back-compat for older scripts
+_persist_inbound_media = _persist_message_media
 
 
 def _digits(value: str) -> str:
@@ -1060,6 +1442,417 @@ def _jid_phone(jid: str) -> str:
         return ""
     user = raw.split("@")[0].split(":")[0]
     return _digits(user)
+
+
+def _jid_lid(jid: str) -> str:
+    """Extract LID digits from an @lid jid; empty otherwise."""
+    raw = (jid or "").strip()
+    if not raw or "@lid" not in raw:
+        return ""
+    return _digits(raw.split("@")[0].split(":")[0])
+
+
+def _is_lid_phone(phone: str, *, lid: str = "") -> bool:
+    """Heuristic: WhatsApp LIDs are long numeric ids, not E.164 mobiles.
+
+    Observed LIDs are often 14–15+ digits; our CRM phones are typically 10–13
+    (IN 91… = 12). When ``lid`` is known, matching digits are always LID.
+    """
+    d = _digits(phone)
+    if not d:
+        return False
+    lid_d = _digits(lid)
+    if lid_d and d == lid_d:
+        return True
+    return len(d) >= 14
+
+
+def _remember_lid(conv: WhatsAppConversation, lid: str) -> None:
+    lid = _digits(lid)
+    if not lid:
+        return
+    if not (conv.customer_lid or "").strip():
+        conv.customer_lid = lid
+
+
+def _lid_mention_digits(text: str) -> list[str]:
+    """Long numeric @mentions are WhatsApp LIDs (not E.164 mobiles)."""
+    import re
+
+    return [m for m in re.findall(r"@(\d{14,})", text or "")]
+
+
+async def humanize_lid_mentions(
+    db: AsyncSession,
+    *,
+    instance_id: int,
+    text: str,
+) -> str:
+    """Replace ``@<LID>`` mention tokens with ``@Name`` when CRM knows the contact.
+
+    Prefer same-instance matches, then fall back to any org conversation that
+    already resolved that LID (mentions often reference people on other lines).
+    """
+    lids = _lid_mention_digits(text)
+    if not lids or not (text or "").strip():
+        return text or ""
+    lid_filter = or_(
+        WhatsAppConversation.customer_lid.in_(lids),
+        WhatsAppConversation.customer_phone.in_(lids),
+        WhatsAppConversation.customer_jid.in_([f"{x}@lid" for x in lids]),
+    )
+    rows = (
+        await db.execute(
+            select(WhatsAppConversation).where(
+                WhatsAppConversation.organization_id == ORG,
+                lid_filter,
+            )
+        )
+    ).scalars().all()
+    # Prefer names from the same WhatsApp instance when both exist.
+    name_by_lid: dict[str, str] = {}
+    same_inst: dict[str, str] = {}
+    for c in rows:
+        name = (c.customer_name or "").strip()
+        if not name or name == (c.customer_phone or "").strip():
+            continue
+        if name.startswith("@") and _digits(name) == name.lstrip("@"):
+            continue
+        keys = {
+            _digits(c.customer_lid or ""),
+            _digits(c.customer_phone or "") if _is_lid_phone(c.customer_phone or "") else "",
+            _jid_lid(c.customer_jid or ""),
+        }
+        for key in keys:
+            if not key or key not in lids:
+                continue
+            if c.whatsapp_instance_id == instance_id:
+                same_inst.setdefault(key, name)
+            else:
+                name_by_lid.setdefault(key, name)
+    name_by_lid.update(same_inst)
+    out = text
+    for lid, name in name_by_lid.items():
+        out = out.replace(f"@{lid}", f"@{name}")
+    return out
+
+
+def _prefer_canonical_conversation(rows: list[WhatsAppConversation]) -> WhatsAppConversation | None:
+    """Prefer PN (@s.whatsapp.net) over orphan @lid shells when several rows match."""
+    if not rows:
+        return None
+
+    def score(c: WhatsAppConversation) -> tuple:
+        jid = (c.customer_jid or "").strip()
+        phone = _digits(c.customer_phone)
+        pn = 0 if jid.endswith("@s.whatsapp.net") or (phone and not _is_lid_phone(phone)) else 1
+        ts = c.last_message_at.timestamp() if c.last_message_at else 0.0
+        return (pn, -ts, c.id)
+
+    return sorted(rows, key=score)[0]
+
+
+async def merge_conversation_into(
+    db: AsyncSession,
+    *,
+    keep: WhatsAppConversation,
+    absorb: WhatsAppConversation,
+) -> None:
+    """Move messages from absorb → keep, learn LID, delete absorb. Same-instance only."""
+    if keep.id == absorb.id:
+        return
+    if keep.whatsapp_instance_id != absorb.whatsapp_instance_id:
+        return
+
+    keep_ext = {
+        m
+        for m in (
+            await db.execute(
+                select(WhatsAppMessage.external_message_id).where(
+                    WhatsAppMessage.conversation_id == keep.id,
+                    WhatsAppMessage.external_message_id != "",
+                )
+            )
+        ).scalars().all()
+        if m
+    }
+    absorb_msgs = (
+        await db.execute(select(WhatsAppMessage).where(WhatsAppMessage.conversation_id == absorb.id))
+    ).scalars().all()
+    for m in absorb_msgs:
+        ext = (m.external_message_id or "").strip()
+        if ext and ext in keep_ext:
+            await db.delete(m)
+            continue
+        m.conversation_id = keep.id
+        if ext:
+            keep_ext.add(ext)
+
+    absorb_lid = (absorb.customer_lid or "").strip() or _jid_lid(absorb.customer_jid or "")
+    if absorb_lid:
+        _remember_lid(keep, absorb_lid)
+    if _is_lid_phone(absorb.customer_phone or ""):
+        _remember_lid(keep, absorb.customer_phone)
+
+    # Keep PN identity on canonical row
+    keep_phone = _digits(keep.customer_phone)
+    absorb_phone = _digits(absorb.customer_phone)
+    if absorb_phone and not _is_lid_phone(absorb_phone):
+        if not keep_phone or _is_lid_phone(keep_phone):
+            keep.customer_phone = absorb_phone
+    keep_jid = (keep.customer_jid or "").strip()
+    absorb_jid = (absorb.customer_jid or "").strip()
+    if absorb_jid.endswith("@s.whatsapp.net") and not keep_jid.endswith("@s.whatsapp.net"):
+        keep.customer_jid = absorb_jid
+    if absorb.customer_name and (not keep.customer_name or keep.customer_name == keep.customer_phone):
+        keep.customer_name = absorb.customer_name
+    if absorb.customer_photo and not keep.customer_photo:
+        keep.customer_photo = absorb.customer_photo
+    if absorb.dealer_id and not keep.dealer_id:
+        keep.dealer_id = absorb.dealer_id
+
+    a_at = absorb.last_message_at
+    k_at = keep.last_message_at
+    if a_at is not None and a_at.tzinfo is None:
+        a_at = a_at.replace(tzinfo=timezone.utc)
+    if k_at is not None and k_at.tzinfo is None:
+        k_at = k_at.replace(tzinfo=timezone.utc)
+    if a_at and (k_at is None or a_at >= k_at):
+        keep.last_message_at = absorb.last_message_at
+        keep.last_message_preview = absorb.last_message_preview or keep.last_message_preview
+    keep.unread_count = (keep.unread_count or 0) + (absorb.unread_count or 0)
+    if (keep.tag or "").lower() == "synced" and (absorb.tag or "").lower() not in {"synced", ""}:
+        keep.tag = absorb.tag
+    elif (keep.tag or "").lower() == "synced" and keep.status == "Open":
+        keep.tag = ""
+
+    # ai_usage_logs.conversation_id is NO ACTION — reassign before delete
+    try:
+        from app.models import AiUsageLog
+
+        usage_rows = (
+            await db.execute(select(AiUsageLog).where(AiUsageLog.conversation_id == absorb.id))
+        ).scalars().all()
+        for u in usage_rows:
+            u.conversation_id = keep.id
+    except Exception:  # noqa: BLE001
+        pass
+
+    await db.delete(absorb)
+    await db.flush()
+
+
+async def _find_conversations_for_peer(
+    db: AsyncSession,
+    inst_id: int,
+    *,
+    phone: str = "",
+    jid: str = "",
+    lid: str = "",
+) -> list[WhatsAppConversation]:
+    phone = _digits(phone)
+    lid = _digits(lid) or _jid_lid(jid)
+    clauses: list[Any] = []
+    if phone and not _is_lid_phone(phone):
+        clauses.append(WhatsAppConversation.customer_phone == phone)
+        clauses.append(WhatsAppConversation.customer_jid == f"{phone}@s.whatsapp.net")
+    if lid:
+        clauses.append(WhatsAppConversation.customer_lid == lid)
+        clauses.append(WhatsAppConversation.customer_jid == f"{lid}@lid")
+        clauses.append(WhatsAppConversation.customer_phone == lid)
+    if jid:
+        clauses.append(WhatsAppConversation.customer_jid == jid)
+        # bare device jid variants (user:device@server)
+        user = jid.split("@")[0].split(":")[0]
+        server = jid.split("@")[1] if "@" in jid else ""
+        if user and server:
+            clauses.append(WhatsAppConversation.customer_jid == f"{user}@{server}")
+    if phone and _is_lid_phone(phone):
+        clauses.append(WhatsAppConversation.customer_phone == phone)
+        clauses.append(WhatsAppConversation.customer_lid == phone)
+        clauses.append(WhatsAppConversation.customer_jid == f"{phone}@lid")
+    if not clauses:
+        return []
+    return list(
+        (
+            await db.execute(
+                select(WhatsAppConversation).where(
+                    WhatsAppConversation.organization_id == ORG,
+                    WhatsAppConversation.whatsapp_instance_id == inst_id,
+                    or_(*clauses),
+                )
+            )
+        ).scalars().all()
+    )
+
+
+_VISIBLE_CONTENT_KEYS = (
+    "conversation",
+    "extendedTextMessage",
+    "imageMessage",
+    "videoMessage",
+    "audioMessage",
+    "documentMessage",
+    "documentWithCaptionMessage",
+    "stickerMessage",
+    "templateMessage",
+    "buttonsMessage",
+    "listMessage",
+    "interactiveMessage",
+    "highlyStructuredMessage",
+)
+
+_SHELL_MESSAGE_KEYS = (
+    "ephemeralMessage",
+    "viewOnceMessage",
+    "viewOnceMessageV2",
+    "viewOnceMessageV2Extension",
+    "documentWithCaptionMessage",
+    "questionMessage",
+    "questionReplyMessage",
+)
+
+
+def _unwrap_message_body(body_src: dict[str, Any]) -> dict[str, Any]:
+    """Unwrap view-once / ephemeral / poll-reply shells to the inner protobuf message."""
+    msg: dict[str, Any] = body_src
+    for _ in range(8):
+        if not isinstance(msg, dict):
+            return {}
+        if any(k in msg for k in _VISIBLE_CONTENT_KEYS):
+            return msg
+        advanced = False
+        for shell in _SHELL_MESSAGE_KEYS:
+            node = msg.get(shell)
+            if not isinstance(node, dict):
+                continue
+            inner = node.get("message") if isinstance(node.get("message"), dict) else None
+            if isinstance(inner, dict):
+                msg = inner
+                advanced = True
+                break
+        if not advanced:
+            return msg
+    return msg if isinstance(msg, dict) else {}
+
+
+def _button_label(node: Any) -> str:
+    if not isinstance(node, dict):
+        return ""
+    for key in ("displayText", "DisplayText", "text", "Text", "buttonText", "ButtonText"):
+        val = str(node.get(key) or "").strip()
+        if val:
+            return val
+    for nested in node.values():
+        if isinstance(nested, dict):
+            label = _button_label(nested)
+            if label:
+                return label
+    return ""
+
+
+def _extract_template_text(tm: dict[str, Any]) -> tuple[str, str]:
+    """Return (body_text, media_hint) from Evolution/whatsmeow templateMessage."""
+    ht = tm.get("hydratedTemplate") or tm.get("hydratedFourRowTemplate") or tm.get("fourRowTemplate")
+    if not isinstance(ht, dict):
+        ht = {}
+    parts: list[str] = []
+    media_hint = ""
+
+    title = ht.get("Title") if "Title" in ht else ht.get("title")
+    if isinstance(title, dict):
+        title_text = str(
+            title.get("HydratedTitleText")
+            or title.get("hydratedTitleText")
+            or title.get("text")
+            or ""
+        ).strip()
+        if title_text:
+            parts.append(title_text)
+        for key, hint in (
+            ("imageMessage", "image"),
+            ("videoMessage", "video"),
+            ("documentMessage", "document"),
+            ("locationMessage", ""),
+        ):
+            if isinstance(title.get(key), dict):
+                media_hint = media_hint or hint
+                break
+    elif isinstance(title, str) and title.strip():
+        parts.append(title.strip())
+
+    content = str(ht.get("hydratedContentText") or ht.get("HydratedContentText") or "").strip()
+    if content:
+        parts.append(content)
+    footer = str(ht.get("hydratedFooterText") or ht.get("HydratedFooterText") or "").strip()
+    if footer:
+        parts.append(footer)
+
+    buttons = ht.get("hydratedButtons") or ht.get("HydratedButtons") or []
+    labels: list[str] = []
+    if isinstance(buttons, list):
+        for raw in buttons:
+            label = _button_label(raw)
+            if label:
+                labels.append(label)
+    if labels:
+        parts.append("[" + " | ".join(labels) + "]")
+
+    # Fallback: highly structured / non-hydrated template bodies
+    if not parts:
+        for key in ("content", "text", "hydratedContentText", "message"):
+            val = tm.get(key)
+            if isinstance(val, str) and val.strip():
+                parts.append(val.strip())
+                break
+            if isinstance(val, dict):
+                nested = str(val.get("text") or val.get("conversation") or "").strip()
+                if nested:
+                    parts.append(nested)
+                    break
+
+    return "\n\n".join(parts).strip(), media_hint
+
+
+def _extract_buttons_or_list_text(body_src: dict[str, Any]) -> str:
+    if isinstance(body_src.get("buttonsMessage"), dict):
+        bm = body_src["buttonsMessage"]
+        parts = [
+            str(bm.get("contentText") or bm.get("text") or "").strip(),
+            str(bm.get("footerText") or "").strip(),
+        ]
+        labels = []
+        for raw in bm.get("buttons") or []:
+            label = _button_label(raw)
+            if label:
+                labels.append(label)
+        if labels:
+            parts.append("[" + " | ".join(labels) + "]")
+        return "\n\n".join(p for p in parts if p)
+
+    if isinstance(body_src.get("listMessage"), dict):
+        lm = body_src["listMessage"]
+        parts = [
+            str(lm.get("title") or "").strip(),
+            str(lm.get("description") or lm.get("body") or "").strip(),
+            str(lm.get("footerText") or "").strip(),
+            str(lm.get("buttonText") or "").strip(),
+        ]
+        return "\n\n".join(p for p in parts if p)
+
+    if isinstance(body_src.get("interactiveMessage"), dict):
+        im = body_src["interactiveMessage"]
+        parts: list[str] = []
+        body = im.get("body") if isinstance(im.get("body"), dict) else {}
+        header = im.get("header") if isinstance(im.get("header"), dict) else {}
+        footer = im.get("footer") if isinstance(im.get("footer"), dict) else {}
+        for node in (header, body, footer):
+            val = str((node or {}).get("text") or (node or {}).get("title") or "").strip()
+            if val:
+                parts.append(val)
+        return "\n\n".join(parts)
+
+    return ""
 
 
 def _extract_message_fields(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -1085,27 +1878,50 @@ def _extract_message_fields(payload: dict[str, Any]) -> dict[str, Any] | None:
         or msg.get("chat")
         or ""
     )
-    if "@g.us" in remote_jid or bool(info.get("IsGroup")):
+    # Channels / status / broadcast stay out of CRM (history sync already skips these).
+    # Real @g.us groups are allowed — name/icon filled via Evolution group APIs.
+    if is_inbox_excluded_jid(remote_jid):
         return None
+    is_group = is_group_jid(remote_jid) or bool(info.get("IsGroup"))
 
-    alt_candidates = [
-        info.get("SenderAlt"),
-        info.get("RecipientAlt"),
-        data.get("JIDAlt"),
-        key.get("remoteJidAlt"),
-        key.get("participantAlt"),
-    ]
-    phone = _jid_phone(remote_jid)
-    if not phone:
+    # Participant identity (groups): Sender / SenderAlt — NEVER use as conversation jid.
+    sender_raw = str(info.get("Sender") or key.get("participant") or data.get("sender") or "")
+    sender_alt = str(
+        info.get("SenderAlt") or key.get("participantAlt") or data.get("senderAlt") or ""
+    )
+    participant_phone = _jid_phone(sender_raw) or _jid_phone(sender_alt) or ""
+    participant_lid = _jid_lid(sender_alt) or _jid_lid(sender_raw) or ""
+
+    if is_group:
+        # Conversation identity is the group Chat jid — keep @g.us.
+        group_user = remote_jid.split("@")[0].split(":")[0] if remote_jid else ""
+        phone = _digits(group_user) or _jid_phone(remote_jid)
+        lid = ""  # do not attach participant LID to the group row
+        if not phone:
+            return None
+    else:
+        alt_candidates = [
+            info.get("SenderAlt"),
+            info.get("RecipientAlt"),
+            data.get("JIDAlt"),
+            key.get("remoteJidAlt"),
+            key.get("participantAlt"),
+        ]
+        phone = _jid_phone(remote_jid)
+        lid = _jid_lid(remote_jid)
         for alt in alt_candidates:
-            phone = _jid_phone(str(alt or ""))
-            if phone:
-                break
-    # last resort: digits from remote (may be LID — still store so chat is visible)
-    if not phone:
-        phone = _digits(remote_jid.split("@")[0].split(":")[0])
-    if not phone:
-        return None
+            alt_s = str(alt or "")
+            if not phone:
+                phone = _jid_phone(alt_s)
+            if not lid:
+                lid = _jid_lid(alt_s)
+        # last resort: digits from remote (may be LID — still store so chat is visible)
+        if not phone:
+            phone = _digits(remote_jid.split("@")[0].split(":")[0])
+        if not phone and not lid:
+            return None
+        if not phone:
+            phone = lid
 
     from_me = bool(
         info.get("IsFromMe")
@@ -1122,30 +1938,70 @@ def _extract_message_fields(payload: dict[str, Any]) -> dict[str, Any] | None:
         body_src = msg
 
     if isinstance(body_src, dict):
+        raw_body = body_src
+        body_src = _unwrap_message_body(body_src)
+        # Skip protocol / reaction stubs with no user-visible content
+        visible_keys = _VISIBLE_CONTENT_KEYS
+        if isinstance(raw_body.get("protocolMessage"), dict) and not any(
+            k in raw_body or k in body_src for k in visible_keys
+        ):
+            return None
+        if "reactionMessage" in raw_body and not any(k in raw_body or k in body_src for k in visible_keys):
+            return None
         text = str(body_src.get("conversation") or "").strip()
         if not text and isinstance(body_src.get("extendedTextMessage"), dict):
             text = str(body_src["extendedTextMessage"].get("text") or "").strip()
-        if not text and isinstance(body_src.get("imageMessage"), dict):
-            text = str(body_src["imageMessage"].get("caption") or "").strip()
-            media_hint = "image"
-        if not text and isinstance(body_src.get("videoMessage"), dict):
-            text = str(body_src["videoMessage"].get("caption") or "").strip()
-            media_hint = "video"
+        if isinstance(body_src.get("imageMessage"), dict):
+            media_hint = media_hint or "image"
+            if not text:
+                text = str(body_src["imageMessage"].get("caption") or "").strip()
+        if isinstance(body_src.get("videoMessage"), dict):
+            media_hint = media_hint or "video"
+            if not text:
+                vm = body_src["videoMessage"]
+                text = str(
+                    vm.get("caption")
+                    or vm.get("accessibilityLabel")
+                    or ""
+                ).strip()
         if isinstance(body_src.get("audioMessage"), dict):
             media_hint = media_hint or "audio"
         if isinstance(body_src.get("documentMessage"), dict):
             media_hint = media_hint or "document"
             if not text:
-                text = str(body_src["documentMessage"].get("fileName") or "").strip()
+                text = str(
+                    body_src["documentMessage"].get("fileName")
+                    or body_src["documentMessage"].get("title")
+                    or ""
+                ).strip()
+        if isinstance(body_src.get("documentWithCaptionMessage"), dict):
+            media_hint = media_hint or "document"
+            nested = body_src["documentWithCaptionMessage"].get("message")
+            if isinstance(nested, dict) and isinstance(nested.get("documentMessage"), dict):
+                doc = nested["documentMessage"]
+                if not text:
+                    text = str(doc.get("caption") or doc.get("fileName") or "").strip()
         if isinstance(body_src.get("stickerMessage"), dict):
             media_hint = media_hint or "sticker"
+        if isinstance(body_src.get("templateMessage"), dict):
+            tmpl_text, tmpl_media = _extract_template_text(body_src["templateMessage"])
+            if tmpl_text and not text:
+                text = tmpl_text
+            media_hint = media_hint or tmpl_media
+        if not text:
+            rich = _extract_buttons_or_list_text(body_src)
+            if rich:
+                text = rich
 
     if not media_hint:
-        info_media = str(info.get("MediaType") or "").lower()
-        if info_media in {"image", "video", "audio", "document", "sticker"}:
-            media_hint = info_media
-        elif str(info.get("Type") or "").lower() == "media":
-            media_hint = "document"
+        media_hint = _normalize_media_type(str(info.get("MediaType") or ""))
+        if not media_hint and str(info.get("Type") or "").lower() == "media":
+            if isinstance(body_src, dict) and isinstance(body_src.get("videoMessage"), dict):
+                media_hint = "video"
+            elif isinstance(body_src, dict) and isinstance(body_src.get("imageMessage"), dict):
+                media_hint = "image"
+            else:
+                media_hint = "document"
 
     if not text:
         raw = data.get("text") or data.get("body") or ""
@@ -1172,17 +2028,86 @@ def _extract_message_fields(payload: dict[str, Any]) -> dict[str, Any] | None:
     if not text and not ext_id and not media_hint:
         return None
 
-    jid = remote_jid if "@" in remote_jid else f"{phone}@s.whatsapp.net"
-    preview = text or ({"image": "📷 Photo", "video": "🎥 Video", "audio": "🎤 Voice message", "document": "📄 Document", "sticker": "Sticker"}.get(media_hint, "[media]"))
+    # Prefer WhatsApp message time (history sync) over ingest wall-clock
+    msg_ts = _parse_wa_timestamp(
+        info.get("Timestamp")
+        or info.get("timestamp")
+        or data.get("timestamp")
+        or data.get("messageTimestamp")
+        or msg.get("messageTimestamp")
+        or key.get("timestamp")
+    )
+
+    # Prefer PN jid when we learned a real phone from alt; keep @lid when LID-only.
+    # Groups must keep the Chat @g.us jid — never rewrite to participant PN/LID.
+    if is_group:
+        if is_group_jid(remote_jid):
+            g_user = remote_jid.split("@")[0].split(":")[0]
+            jid = f"{g_user}@g.us"
+        else:
+            jid = f"{phone}@g.us"
+    elif phone and not _is_lid_phone(phone, lid=lid):
+        jid = f"{phone}@s.whatsapp.net"
+    elif lid:
+        jid = f"{lid}@lid"
+    else:
+        jid = remote_jid if "@" in remote_jid else f"{phone}@s.whatsapp.net"
+    # Never store raw "[media]" — always a human label (UI also guards this).
+    # Only use "Attachment" when we know it is media but lack a concrete type.
+    media_labels = {
+        "image": "📷 Photo",
+        "video": "🎥 Video",
+        "audio": "🎤 Voice message",
+        "document": "📄 Document",
+        "sticker": "Sticker",
+    }
+    if text:
+        preview = text
+    elif media_hint:
+        preview = media_labels.get(media_hint, "Attachment")
+    else:
+        # Non-media protobuf we could not decode — keep chat row but avoid fake media label.
+        preview = "Unsupported message"
     return {
         "phone": phone,
         "jid": jid,
+        "lid": lid,
         "from_me": from_me,
         "text": preview,
         "push_name": push_name,
         "external_id": ext_id,
         "media_type": media_hint,
+        "timestamp": msg_ts,
+        "is_group": is_group,
+        "participant_phone": participant_phone,
+        "participant_lid": participant_lid,
     }
+
+
+def _parse_wa_timestamp(raw: Any) -> datetime | None:
+    """Parse Evolution/whatsmeow timestamps (unix sec/ms, ISO, or time.Time string)."""
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, (int, float)):
+        val = float(raw)
+        if val > 1e12:  # ms
+            val /= 1000.0
+        elif val > 1e10:  # µs unlikely but guard
+            val /= 1_000_000.0
+        try:
+            return datetime.fromtimestamp(val, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return _parse_wa_timestamp(int(text))
+    try:
+        # RFC3339 / ISO
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 async def _ingest_webhook_message(
@@ -1191,48 +2116,97 @@ async def _ingest_webhook_message(
     fields = _extract_message_fields(payload)
     if not fields:
         return
+    if is_inbox_excluded_jid(fields.get("jid") or ""):
+        return
+    is_group = bool(fields.get("is_group")) or is_group_jid(fields.get("jid") or "")
+    # Participant LID must never drive group conversation matching / merge.
+    lid_digits = (
+        ""
+        if is_group
+        else (_digits(fields.get("lid") or "") or _jid_lid(fields.get("jid") or ""))
+    )
     if fields["external_id"]:
         exists = (
             await db.execute(
                 select(WhatsAppMessage).where(
-                    WhatsAppMessage.external_message_id == fields["external_id"],
                     WhatsAppMessage.whatsapp_instance_id == inst.id,
+                    or_(
+                        WhatsAppMessage.external_message_id == fields["external_id"],
+                        # CRM send uses client_message_id as Evolution msg id; webhook may
+                        # arrive before external_message_id is written (race → LID dupe).
+                        WhatsAppMessage.client_message_id == fields["external_id"],
+                    ),
                 )
             )
         ).scalar_one_or_none()
         if exists:
             # Upgrade tick if this is our outbound echo
-            if fields["from_me"] and exists.direction == "out" and exists.status in {"sending", "sent"}:
-                exists.status = "delivered"
+            if fields["from_me"] and exists.direction == "out" and exists.status in {"sending", "sent", "delivered"}:
+                if exists.status in {"sending", "sent"}:
+                    exists.status = "delivered"
+            if not (exists.external_message_id or "").strip():
+                exists.external_message_id = fields["external_id"]
+            # Learn LID on the conversation that already owns this message (CRM send path).
+            # Skip for groups — participant LID is not the chat identity.
+            owned = await db.get(WhatsAppConversation, exists.conversation_id)
+            if owned and lid_digits and not is_group_jid(owned.customer_jid or ""):
+                _remember_lid(owned, lid_digits)
             return
 
-    # Match by phone, LID jid, or LID digits mistakenly stored as phone
-    lid_digits = _digits(fields["jid"].split("@")[0]) if "@lid" in (fields["jid"] or "") else ""
-    match_phones = [p for p in [fields["phone"], lid_digits] if p]
-    match_clauses = [
-        WhatsAppConversation.customer_phone.in_(match_phones) if match_phones else False,
-        WhatsAppConversation.customer_jid == fields["jid"] if fields["jid"] else False,
-    ]
-    if lid_digits:
-        match_clauses.append(WhatsAppConversation.customer_jid == f"{lid_digits}@lid")
-        match_clauses.append(WhatsAppConversation.customer_phone == lid_digits)
-    live_clauses = [c for c in match_clauses if c is not False]
-    conv = (
-        await db.execute(
-            select(WhatsAppConversation).where(
-                WhatsAppConversation.organization_id == ORG,
-                WhatsAppConversation.whatsapp_instance_id == inst.id,
-                or_(*live_clauses) if live_clauses else False,
-            )
-        )
-    ).scalar_one_or_none()
+    # Groups: match only by @g.us jid / group id. DMs: PN + LID peer matching.
+    peers = await _find_conversations_for_peer(
+        db,
+        inst.id,
+        phone=fields.get("phone") or "",
+        jid=fields.get("jid") or "",
+        lid="" if is_group else lid_digits,
+    )
+    if is_group:
+        # Prefer an existing @g.us row; never fold into a participant LID/PN DM.
+        group_peers = [p for p in peers if is_group_jid(p.customer_jid or "")]
+        conv = _prefer_canonical_conversation(group_peers) or None
+        if conv is None:
+            # Exact jid match only (ignore LID-like phone collisions from peer helper)
+            for p in peers:
+                if (p.customer_jid or "").strip().lower() == (fields.get("jid") or "").strip().lower():
+                    conv = p
+                    break
+    else:
+        conv = _prefer_canonical_conversation(peers)
+        # Fold any LID orphan shells matched in the same peer set into the canonical row.
+        if conv and len(peers) > 1:
+            for other in peers:
+                if other.id == conv.id:
+                    continue
+                other_jid = (other.customer_jid or "").strip()
+                other_phone = _digits(other.customer_phone)
+                if other_jid.endswith("@lid") or _is_lid_phone(other_phone) or (other.customer_lid or "") == lid_digits:
+                    await merge_conversation_into(db, keep=conv, absorb=other)
+
     now = datetime.now(timezone.utc)
-    # Prefer PN as customer_phone when jid is LID
+    event_at = fields.get("timestamp") or now
+    # Prefer PN as customer_phone / jid; never overwrite PN with LID.
+    # Groups keep @g.us — never rewrite to participant @lid / @s.whatsapp.net.
     store_phone = fields["phone"]
     store_jid = fields["jid"]
-    if "@lid" in store_jid and store_phone == lid_digits:
-        # only LID known — keep digits as phone but jid must stay @lid for send
+    if is_group or is_group_jid(store_jid):
+        g_user = (store_jid.split("@")[0].split(":")[0] if store_jid else "") or store_phone
+        store_phone = _digits(g_user) or store_phone
+        store_jid = f"{store_phone}@g.us" if store_phone else store_jid
+    elif lid_digits and (
+        not store_phone
+        or store_phone == lid_digits
+        or _is_lid_phone(store_phone, lid=lid_digits)
+    ):
+        store_phone = lid_digits
         store_jid = f"{lid_digits}@lid"
+    elif store_phone and not _is_lid_phone(store_phone, lid=lid_digits):
+        store_jid = f"{store_phone}@s.whatsapp.net"
+
+    display_text = await humanize_lid_mentions(db, instance_id=inst.id, text=fields["text"])
+    preview_text = display_text
+    if is_group and not fields["from_me"] and (fields.get("push_name") or "").strip():
+        preview_text = f"{fields['push_name'].strip()}: {display_text}"
 
     if not conv:
         conv = WhatsAppConversation(
@@ -1240,64 +2214,130 @@ async def _ingest_webhook_message(
             organization_id=ORG,
             whatsapp_instance_id=inst.id,
             customer_phone=store_phone,
-            customer_name=fields["push_name"],
+            customer_name=("" if is_group or is_group_jid(store_jid) else fields["push_name"]),
             customer_jid=store_jid,
+            customer_lid="" if is_group else (lid_digits if lid_digits else ""),
             status="New" if not fields["from_me"] else "Open",
             tag="New" if not fields["from_me"] else "",
-            last_message_preview=fields["text"][:255],
-            last_message_at=now,
-            unread_count=0 if fields["from_me"] else 1,
+            last_message_preview=preview_text[:255],
+            last_message_at=event_at,
+            unread_count=(
+                0
+                if fields["from_me"] or event_at < now - timedelta(minutes=5)
+                else 1
+            ),
         )
         db.add(conv)
         await db.flush()
+        await assign_conversation_to_instance_owner(db, conv, inst.id)
     else:
-        if fields["push_name"] and (not conv.customer_name or conv.customer_name == conv.customer_phone):
+        if not conv.assigned_employee_id:
+            await assign_conversation_to_instance_owner(db, conv, inst.id)
+        if (
+            not is_group
+            and not is_group_jid(store_jid)
+            and fields["push_name"]
+            and (not conv.customer_name or conv.customer_name == conv.customer_phone)
+        ):
             conv.customer_name = fields["push_name"]
-        # Upgrade LID-as-phone → real PN when we learn it
-        if store_phone and store_phone != lid_digits:
-            if not conv.customer_phone or conv.customer_phone == lid_digits or len(conv.customer_phone) > 15:
+        if lid_digits and not is_group and not is_group_jid(conv.customer_jid or ""):
+            _remember_lid(conv, lid_digits)
+        # Upgrade LID-as-phone → real PN when we learn it (DMs only)
+        if (
+            not is_group
+            and store_phone
+            and not _is_lid_phone(store_phone, lid=lid_digits)
+        ):
+            if not conv.customer_phone or _is_lid_phone(conv.customer_phone, lid=lid_digits):
                 conv.customer_phone = store_phone
-        if store_jid:
-            if "@lid" in store_jid or not (conv.customer_jid or "").endswith("@lid"):
-                conv.customer_jid = store_jid
-        conv.last_message_preview = fields["text"][:255]
-        conv.last_message_at = now
-        if not fields["from_me"]:
-            conv.unread_count = (conv.unread_count or 0) + 1
-            if conv.status == "Resolved":
-                conv.status = "Open"
-                conv.tag = "Reopened"
-            elif conv.status == "New":
-                pass
+            if not (conv.customer_jid or "").endswith("@s.whatsapp.net"):
+                conv.customer_jid = f"{store_phone}@s.whatsapp.net"
+        # Ensure group rows keep @g.us even if an older bug wrote something else
+        if is_group and store_jid and not is_group_jid(conv.customer_jid or ""):
+            conv.customer_jid = store_jid
+            conv.customer_phone = store_phone
+            conv.customer_lid = ""
+        # Only bump preview/unread for messages newer than (or equal to) last known
+        last_at = conv.last_message_at
+        if last_at is not None and last_at.tzinfo is None:
+            last_at = last_at.replace(tzinfo=timezone.utc)
+        is_newer = last_at is None or event_at >= last_at
+        if is_newer:
+            conv.last_message_preview = preview_text[:255]
+            conv.last_message_at = event_at
+            if fields["from_me"]:
+                # Reply from the physical phone (or linked device) → clear CRM unread/New
+                clear_conversation_unread(conv)
+                if conv.status in {"Pending Customer Reply", "Resolved"}:
+                    conv.status = "Open"
             else:
-                conv.status = "Open"
+                # History backfill of old inbound should not inflate unread
+                if event_at >= now - timedelta(minutes=5):
+                    conv.unread_count = (conv.unread_count or 0) + 1
+                    if conv.status == "Resolved":
+                        conv.status = "Open"
+                        conv.tag = "Reopened"
+                    elif conv.status != "New":
+                        conv.status = "Open"
 
+    # Group subject + icon only (newsletters already skipped by is_inbox_excluded_jid)
+    if is_group or is_group_jid(conv.customer_jid or store_jid or ""):
+        try:
+            from app.whatsapp_chat_meta import enrich_conversation_meta
+
+            need_meta = (
+                not (conv.customer_name or "").strip()
+                or conv.customer_name == conv.customer_phone
+                or not (conv.customer_photo or "").strip()
+            )
+            if need_meta:
+                _, svc_meta = await _svc(db)
+                token_meta = decrypt_secret(inst.encrypted_instance_token)
+                await enrich_conversation_meta(svc=svc_meta, token=token_meta, conv=conv, force=False)
+        except Exception as exc:  # noqa: BLE001
+            print(f"group meta skipped: {exc}")
+
+    media_labels = {
+        "image": "📷 Photo",
+        "video": "🎥 Video",
+        "audio": "🎤 Voice message",
+        "document": "📄 Document",
+        "sticker": "Sticker",
+    }
     media_meta: dict[str, str] = {
         "media_type": fields.get("media_type") or "",
-        "media_name": "",
+        "media_name": {
+            "image": "photo.jpg",
+            "video": "video.mp4",
+            "audio": "voice.ogg",
+            "document": "file",
+            "sticker": "sticker.webp",
+        }.get(fields.get("media_type") or "", ""),
         "media_url": "",
     }
-    body_text = fields["text"]
-    # Auto-download inbound media (all types) onto VPS disk — uses full webhook body
-    if not fields["from_me"]:
+    body_text = display_text
+    # Persist media for inbound AND outbound (phone-sent / history-sync) messages
+    if fields.get("media_type") or _message_node(payload):
         try:
             _, svc = await _svc(db)
             token = decrypt_secret(inst.encrypted_instance_token)
-            saved = await _persist_inbound_media(svc, token, payload)
+            saved = await _persist_message_media(svc, token, payload)
             if saved:
                 media_meta = {**media_meta, **{k: v for k, v in saved.items() if v}}
-                labels = {
-                    "image": "📷 Photo",
-                    "video": "🎥 Video",
-                    "audio": "🎤 Voice message",
-                    "document": "📄 Document",
-                    "sticker": "Sticker",
-                }
-                if media_meta.get("media_type") and body_text in {"", "[media]", *labels.values()}:
-                    body_text = labels.get(media_meta["media_type"], "[media]")
+                if media_meta.get("media_type") and body_text in {"", "[media]", "media", "Attachment", *media_labels.values()}:
+                    body_text = media_labels.get(media_meta["media_type"], "Attachment")
         except Exception as exc:  # noqa: BLE001
-            print(f"inbound media download skipped: {exc}")
+            print(f"media download skipped: {exc}")
+    if media_meta.get("media_type") and body_text in {"", "[media]", "media", "Attachment"}:
+        body_text = media_labels.get(media_meta["media_type"], "Attachment")
+    if body_text.strip().lower() in {"[media]", "media"}:
+        body_text = "Attachment"
 
+    sender_label = "WhatsApp" if fields["from_me"] else (
+        fields["push_name"]
+        or fields.get("participant_phone")
+        or fields["phone"]
+    )
     msg = WhatsAppMessage(
         public_id=str(uuid.uuid4()),
         organization_id=ORG,
@@ -1310,10 +2350,22 @@ async def _ingest_webhook_message(
         media_name=media_meta.get("media_name") or "",
         external_message_id=fields["external_id"],
         status="sent" if fields["from_me"] else "delivered",
-        sender_name="WhatsApp" if fields["from_me"] else (fields["push_name"] or fields["phone"]),
+        sender_name=sender_label,
+        created_at=event_at,
     )
     db.add(msg)
     await db.flush()
+
+    # Sarvam STT after media is on disk (inbound + outbound voice). Non-blocking.
+    if (msg.media_type or "").lower() in {"audio", "ptt", "voice"} and (msg.media_url or "").startswith(
+        "/api/whatsapp/media/"
+    ):
+        try:
+            from app.sarvam_transcribe import schedule_transcription
+
+            schedule_transcription(msg.id)
+        except Exception as exc:  # noqa: BLE001
+            print(f"transcription schedule skipped: {exc}")
 
     # Live notify agents (WhatsApp-style)
     try:

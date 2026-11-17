@@ -3,6 +3,7 @@ import { useSearchParams } from "react-router-dom";
 import Adms from "./Adms";
 import Employees from "./Employees";
 import EvolutionSettings from "./EvolutionSettings";
+import GeminiSettings from "./GeminiSettings";
 import VpsHealth from "./VpsHealth";
 import ZohoSettings from "./ZohoSettings";
 
@@ -15,6 +16,7 @@ export const SETTINGS_TABS = [
   { id: "zoho", label: "Zoho" },
   { id: "meta", label: "Meta" },
   { id: "yesone", label: "yesone" },
+  { id: "gemini", label: "Gemini" },
 ] as const;
 
 export type SettingsTabId = (typeof SETTINGS_TABS)[number]["id"];
@@ -60,6 +62,7 @@ export default function Settings() {
       {tab === "yesone" && (
         <ComingSoonPanel title="yesone" subtitle="Coming soon — configure YesOne product integration." />
       )}
+      {tab === "gemini" && <GeminiSettings />}
     </div>
   );
 }

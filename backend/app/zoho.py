@@ -639,22 +639,25 @@ async def zoho_webhook(
             provided = auth
 
     raw_body = await request.body()
-    payload: Any
-    try:
-        payload = json.loads(raw_body.decode("utf-8") or "{}") if raw_body else {}
-    except Exception:  # noqa: BLE001
-        payload = {"raw": raw_body.decode("utf-8", errors="replace")} if raw_body else {}
+    content_type = request.headers.get("content-type") or ""
+    payload: Any = zs.parse_zoho_webhook_body(raw_body, content_type)
     if not isinstance(payload, dict):
         payload = {"data": payload}
 
     # Zoho Books URL validation often POSTs without custom headers / with empty body.
     # Accept those probes with 200 so the URL can be saved; real events must auth.
-    is_probe = (not raw_body) or payload == {} or str(payload.get("event_type") or "").lower() in {
-        "ping",
-        "verify",
-        "test",
-        "url_validation",
-    }
+    is_probe = (
+        (not raw_body)
+        or payload == {}
+        or bool(payload.get("ping"))
+        or str(payload.get("event_type") or "").lower()
+        in {
+            "ping",
+            "verify",
+            "test",
+            "url_validation",
+        }
+    )
     secret_ok = False
     if not expected:
         if provided:

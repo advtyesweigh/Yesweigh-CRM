@@ -25,6 +25,9 @@ type Instance = {
   profile_photo?: string;
   assignees: { employee_id: number; name: string; is_primary_owner: boolean }[];
   last_connected_at?: string | null;
+  history_sync_status?: string;
+  history_sync_at?: string | null;
+  history_sync_error?: string;
 };
 
 type EligibleEmployee = {
@@ -73,6 +76,11 @@ export default function EvolutionSettings() {
   const [selectedEmployeeId, setSelectedEmployeeId] = useState<number | null>(null);
   const [qrLoading, setQrLoading] = useState(false);
   const [qrError, setQrError] = useState("");
+  const [linkMode, setLinkMode] = useState<"qr" | "phone">("qr");
+  const [pairPhone, setPairPhone] = useState("");
+  const [pairingCode, setPairingCode] = useState("");
+  const [pairLoading, setPairLoading] = useState(false);
+  const [pairError, setPairError] = useState("");
 
   const selectedEmployee = useMemo(
     () => eligible.find((e) => e.employee_id === selectedEmployeeId) || null,
@@ -187,15 +195,64 @@ export default function EvolutionSettings() {
     setQrLoading(true);
     setQrData(null);
     setQrError("");
+    setLinkMode("qr");
+    setPairingCode("");
+    setPairError("");
+    const row = items.find((i) => i.id === id);
+    setPairPhone((row?.expected_phone_number || row?.connected_phone_number || "").replace(/^\+/, ""));
     try {
-      const qr = await api(`/api/whatsapp/instances/${id}/qrcode`);
+      const qr = await api<Record<string, unknown>>(`/api/whatsapp/instances/${id}/qrcode`);
       setQrData(qr);
+      // Keep summary/row status in sync with Evolution (LoggedIn vs QR Required)
+      await loadInstances();
     } catch (e) {
       const msg = e instanceof Error ? e.message : "QR failed";
       setQrError(msg);
       showToast(msg);
     } finally {
       setQrLoading(false);
+    }
+  }
+
+  async function requestPairingCode() {
+    if (!activeId) return;
+    const phone = pairPhone.trim();
+    if (!phone) {
+      setPairError("Enter the WhatsApp phone number with country code");
+      return;
+    }
+    setPairLoading(true);
+    setPairError("");
+    setPairingCode("");
+    try {
+      const res = await api<{
+        connected?: boolean;
+        pairing_code?: string | null;
+        phone?: string;
+        connection_status?: string;
+      }>(`/api/whatsapp/instances/${activeId}/pairing-code`, {
+        method: "POST",
+        body: JSON.stringify({ phone }),
+      });
+      if (res.connected) {
+        setQrData({ connected: true, phone: res.phone, connection_status: res.connection_status });
+        showToast("WhatsApp is already connected");
+        await loadInstances();
+        return;
+      }
+      const code = String(res.pairing_code || "").trim();
+      if (!code) {
+        throw new Error("No pairing code returned");
+      }
+      setPairingCode(code);
+      showToast("Pairing code ready — enter it on the phone");
+      await loadInstances();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Pairing code failed";
+      setPairError(msg);
+      showToast(msg);
+    } finally {
+      setPairLoading(false);
     }
   }
 
@@ -209,13 +266,35 @@ export default function EvolutionSettings() {
     }
   }
 
+  async function syncHistory(id: string) {
+    try {
+      await api(`/api/whatsapp/instances/${id}/sync-history`, { method: "POST", body: "{}" });
+      showToast("History sync started");
+      await loadInstances();
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : "Sync failed");
+    }
+  }
+
   async function act(id: string, action: "restart" | "disconnect" | "delete") {
-    if (action === "delete" && !confirm("Delete this YesWeigh WhatsApp instance? This cannot be undone.")) return;
+    let deletePassword = "";
+    if (action === "delete") {
+      const entered = window.prompt(
+        "Enter delete password to remove this YesWeigh WhatsApp instance. This cannot be undone.",
+      );
+      if (entered === null) return;
+      deletePassword = entered.trim();
+      if (deletePassword !== "1010") {
+        showToast("Incorrect delete password");
+        return;
+      }
+    }
     try {
       const method = action === "delete" ? "DELETE" : "POST";
       await api(`/api/whatsapp/instances/${id}${action === "delete" ? "" : `/${action}`}`, {
         method,
-        body: method === "POST" ? "{}" : undefined,
+        body: action === "delete" ? JSON.stringify({ password: deletePassword }) : method === "POST" ? "{}" : undefined,
+        headers: action === "delete" ? { "X-WhatsApp-Delete-Password": deletePassword } : undefined,
       });
       showToast(action === "delete" ? "Deleted" : `${action} done`);
       await loadInstances();
@@ -375,10 +454,27 @@ export default function EvolutionSettings() {
                         </td>
                         <td>{i.connected_phone_number || i.expected_phone_number || "—"}</td>
                         <td>{i.assignees.length ? i.assignees.map((a) => a.name).join(", ") : "Unassigned"}</td>
-                        <td><span className={`evo-pill ${statusClass(i.connection_status)}`}>{i.connection_status}</span></td>
+                        <td>
+                          <span className={`evo-pill ${statusClass(i.connection_status)}`}>{i.connection_status}</span>
+                          {i.history_sync_status ? (
+                            <div style={{ marginTop: 4, fontSize: 12, color: "#64748b" }}>
+                              Sync: {i.history_sync_status}
+                              {i.history_sync_at ? ` · ${new Date(i.history_sync_at).toLocaleString()}` : ""}
+                            </div>
+                          ) : null}
+                        </td>
                         <td>
                           <div className="emp-actions">
                             <button type="button" className="btn" onClick={() => openQr(i.id)}>QR</button>
+                            <button
+                              type="button"
+                              className="btn"
+                              disabled={i.history_sync_status === "running"}
+                              onClick={() => syncHistory(i.id)}
+                              title="Download contacts and request chat history from Evolution/WhatsApp"
+                            >
+                              {i.history_sync_status === "running" ? "Syncing…" : "Sync history"}
+                            </button>
                             <button type="button" className="btn" onClick={() => act(i.id, "disconnect")}>Disconnect</button>
                             <button type="button" className="btn" onClick={() => act(i.id, "delete")}>Delete</button>
                           </div>
@@ -470,17 +566,43 @@ export default function EvolutionSettings() {
 
       {qrOpen && (
         <div className="emp-overlay" onClick={(e) => { if (e.target === e.currentTarget) setQrOpen(false); }}>
-          <section className="emp-drawer" style={{ maxWidth: 480, margin: "auto", height: "auto", borderRadius: 12 }}>
+          <section className="emp-drawer evo-qr-modal" role="dialog" aria-modal="true" aria-labelledby="evo-qr-title">
             <div className="emp-drawer-head">
               <div>
-                <h2>Scan QR Code</h2>
-                <p>WhatsApp → Linked Devices → Link a Device</p>
+                <h2 id="evo-qr-title">Link WhatsApp</h2>
+                <p>
+                  {linkMode === "qr"
+                    ? "WhatsApp → Linked Devices → Link a Device → Scan QR"
+                    : "WhatsApp → Linked Devices → Link a Device → Link with phone number"}
+                </p>
               </div>
-              <button type="button" className="iconbtn" onClick={() => setQrOpen(false)}>✕</button>
+              <button type="button" className="iconbtn" onClick={() => setQrOpen(false)} aria-label="Close">✕</button>
             </div>
             <div className="emp-formbody" style={{ textAlign: "center" }}>
-              {qrLoading && <div className="emp-empty">Waiting for QR from Evolution…</div>}
-              {!qrLoading && qrConnected && (
+              {!qrConnected && (
+                <div className="evo-link-tabs" role="tablist" aria-label="Link method">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={linkMode === "qr"}
+                    className={linkMode === "qr" ? "active" : ""}
+                    onClick={() => setLinkMode("qr")}
+                  >
+                    Scan QR
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={linkMode === "phone"}
+                    className={linkMode === "phone" ? "active" : ""}
+                    onClick={() => setLinkMode("phone")}
+                  >
+                    Link with phone number
+                  </button>
+                </div>
+              )}
+
+              {qrConnected && (
                 <div className="emp-empty" style={{ color: "#087a56" }}>
                   WhatsApp is connected
                   {(qrData as Record<string, unknown>)?.phone
@@ -488,16 +610,66 @@ export default function EvolutionSettings() {
                     : ""}
                 </div>
               )}
-              {!qrLoading && !qrConnected && qrImage && (
-                <img src={qrImage} alt="WhatsApp QR" style={{ width: 260, height: 260, objectFit: "contain" }} />
+
+              {!qrConnected && linkMode === "qr" && (
+                <>
+                  {qrLoading && <div className="emp-empty">Waiting for QR from Evolution…</div>}
+                  {!qrLoading && qrImage && (
+                    <img src={qrImage} alt="WhatsApp QR" style={{ width: 260, height: 260, objectFit: "contain" }} />
+                  )}
+                  {!qrLoading && !qrImage && (
+                    <div className="emp-empty" style={{ whiteSpace: "pre-wrap", color: qrError ? "#bd2438" : undefined }}>
+                      {qrError || "QR not ready yet. Click Refresh QR."}
+                    </div>
+                  )}
+                </>
               )}
-              {!qrLoading && !qrConnected && !qrImage && (
-                <div className="emp-empty" style={{ whiteSpace: "pre-wrap", color: qrError ? "#bd2438" : undefined }}>
-                  {qrError || "QR not ready yet. Click Refresh QR."}
+
+              {!qrConnected && linkMode === "phone" && (
+                <div className="evo-pair-panel">
+                  <p className="evo-pair-hint">
+                    Use this when QR scan fails (“Couldn&apos;t link device”). Enter the staff WhatsApp number with country code.
+                  </p>
+                  <div className="field evo-pair-field">
+                    <label htmlFor="evo-pair-phone">Phone number</label>
+                    <input
+                      id="evo-pair-phone"
+                      type="tel"
+                      inputMode="tel"
+                      placeholder="919876543210"
+                      value={pairPhone}
+                      onChange={(e) => setPairPhone(e.target.value)}
+                      autoComplete="tel"
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    className="btn primary"
+                    disabled={pairLoading}
+                    onClick={() => requestPairingCode()}
+                  >
+                    {pairLoading ? "Getting code…" : "Get pairing code"}
+                  </button>
+                  {pairError && (
+                    <div className="emp-empty" style={{ color: "#bd2438", whiteSpace: "pre-wrap", marginTop: 12 }}>
+                      {pairError}
+                    </div>
+                  )}
+                  {pairingCode && (
+                    <div className="evo-pair-code" aria-live="polite">
+                      <small>Enter this code on the phone</small>
+                      <strong>{pairingCode}</strong>
+                    </div>
+                  )}
                 </div>
               )}
+
               <div className="actions" style={{ justifyContent: "center", marginTop: 16 }}>
-                <button type="button" className="btn" disabled={qrLoading} onClick={() => activeId && openQr(activeId)}>Refresh QR</button>
+                {linkMode === "qr" && !qrConnected && (
+                  <button type="button" className="btn" disabled={qrLoading} onClick={() => activeId && openQr(activeId)}>
+                    Refresh QR
+                  </button>
+                )}
                 <button type="button" className="btn" onClick={() => activeId && refreshStatus(activeId)}>Check status</button>
                 <button type="button" className="btn primary" onClick={() => { setQrOpen(false); loadInstances(); }}>Done</button>
               </div>

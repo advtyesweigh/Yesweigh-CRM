@@ -88,6 +88,26 @@ def _punch_clock(punch_time: str | None) -> tuple[int, int] | None:
         return None
 
 
+def _seconds_between_punches(a: str | None, b: str | None) -> int | None:
+    """Absolute seconds between two punch_time strings (YYYY-MM-DD HH:MM:SS)."""
+    if not a or not b or len(a) < 19 or len(b) < 19:
+        return None
+    try:
+        ta = datetime.strptime(a[:19], "%Y-%m-%d %H:%M:%S")
+        tb = datetime.strptime(b[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return abs(int((tb - ta).total_seconds()))
+
+
+def _is_duplicate_checkout(cin: str, cout: str, *, window_seconds: int = 60) -> bool:
+    """True when max punch is within window of min — treat as re-punch, not check-out."""
+    if not cin or not cout or cin == cout:
+        return True
+    secs = _seconds_between_punches(cin, cout)
+    return secs is not None and secs <= window_seconds
+
+
 def _minutes_between(a: tuple[int, int], b: tuple[int, int]) -> int:
     return a[0] * 60 + a[1] - (b[0] * 60 + b[1])
 
@@ -288,6 +308,7 @@ async def daily_report(
     exclude = and_(
         AdmsAttendanceLog.device_serial.notin_(["TEST", "test", "SIMULATOR", "DEMO"]),
         ~AdmsAttendanceLog.device_serial.ilike("test%"),
+        AdmsAttendanceLog.firebase_status != "voided",
         AdmsAttendanceLog.punch_date >= day,
         AdmsAttendanceLog.punch_date <= day_to,
     )
@@ -330,8 +351,8 @@ async def daily_report(
 
         cin = str(r.check_in or "")
         cout = str(r.check_out or "")
-        same = cin == cout
-        cout_display = None if same else cout
+        # Same-minute / ≤60s re-punches must not become check-out (inflates early/hours).
+        cout_display = None if _is_duplicate_checkout(cin, cout) else cout
         shift = shift_for_date(punch_date)
         m = _row_metrics(cin=cin, cout_display=cout_display, shift=shift)
 
@@ -419,6 +440,7 @@ async def daily_report(
             .where(
                 and_(
                     AdmsAttendanceLog.punch_date == kpi_day,
+                    AdmsAttendanceLog.firebase_status != "voided",
                     AdmsAttendanceLog.device_serial.notin_(["TEST", "test", "SIMULATOR", "DEMO"]),
                     ~AdmsAttendanceLog.device_serial.ilike("test%"),
                 )

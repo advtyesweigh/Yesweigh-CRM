@@ -21,13 +21,13 @@ const NAV: { group: string; items: { to: string; label: string; icon: NavIconId 
       { to: "/analytics", label: "Analytics", icon: "chart" },
       { to: "/whatsapp", label: "WhatsApp Inbox", icon: "whatsapp" },
       { to: "/calling", label: "Call List", icon: "phone" },
+      { to: "/work", label: "AI Agent", icon: "checklist" },
       { to: "/leads", label: "Leads", icon: "users" },
       { to: "/dealers", label: "Dealer", icon: "store" },
       { to: "/orders", label: "Quotations", icon: "file" },
       { to: "/campaigns", label: "Campaigns", icon: "megaphone" },
       { to: "/meta", label: "Meta Ads", icon: "target" },
       { to: "/assets", label: "Marketing Assets", icon: "image" },
-      { to: "/work", label: "Work Management", icon: "checklist" },
       { to: "/products", label: "Products", icon: "package" },
       { to: "/performance", label: "Performance", icon: "trending" },
       { to: "/reports", label: "Reports", icon: "bars" },
@@ -156,8 +156,19 @@ function Shell({ children }: { children: React.ReactNode }) {
   }, [sidebarOpen]);
 
   const isInbox = loc.pathname === "/whatsapp";
+  const isAiAgent = loc.pathname === "/work" || loc.pathname === "/ai";
   const isSettings = loc.pathname === "/settings";
   const settingsTab = parseSettingsTab(params.get("tab"));
+
+  useEffect(() => {
+    if (isAiAgent) document.title = "AI Agent · YesWeigh CRM";
+    else if (isSettings) document.title = "Settings · YesWeigh CRM";
+    else if (isInbox) document.title = "WhatsApp Inbox · YesWeigh CRM";
+    else {
+      const title = TITLES[loc.pathname === "/" ? "/" : loc.pathname];
+      document.title = title ? `${title} · YesWeigh CRM` : "YesWeigh CRM";
+    }
+  }, [isAiAgent, isSettings, isInbox, loc.pathname]);
 
   function setSettingsTab(id: SettingsTabId) {
     const next = new URLSearchParams(params);
@@ -176,7 +187,7 @@ function Shell({ children }: { children: React.ReactNode }) {
   }
 
   return (
-    <div className={`app ${sidebarOpen ? "" : "nav-collapsed"} ${isInbox ? "inbox-mode" : ""} ${isSettings ? "settings-mode" : ""}`.trim()}>
+    <div className={`app ${sidebarOpen ? "" : "nav-collapsed"} ${isInbox ? "inbox-mode" : ""} ${isAiAgent ? "ai-mode" : ""} ${isSettings ? "settings-mode" : ""}`.trim()}>
       {!sidebarOpen && (
         <button
           type="button"
@@ -251,7 +262,7 @@ function Shell({ children }: { children: React.ReactNode }) {
             </div>
           </header>
         )}
-        <div className={`content ${isInbox ? "content-inbox" : ""}`}>{children}</div>
+        <div className={`content ${isInbox ? "content-inbox" : ""} ${isAiAgent ? "content-ai" : ""}`.trim()}>{children}</div>
       </main>
     </div>
   );
@@ -270,6 +281,7 @@ export default function App() {
       <Route path="/analytics" element={<Private><Analytics /></Private>} />
       <Route path="/leads" element={<Private><Leads /></Private>} />
       <Route path="/work" element={<Private><Work /></Private>} />
+      <Route path="/ai" element={<Navigate to="/work" replace />} />
       <Route path="/whatsapp" element={<Private><WhatsApp /></Private>} />
       <Route path="/employees" element={<Navigate to="/settings?tab=employees" replace />} />
       <Route path="/employees/:id" element={<Private><EmployeeProfile /></Private>} />

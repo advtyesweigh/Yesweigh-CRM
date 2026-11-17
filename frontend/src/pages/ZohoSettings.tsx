@@ -539,10 +539,12 @@ function EndpointsBlock({
           </p>
           <ul style={{ margin: 0, paddingLeft: 18 }}>
             <li>
-              <strong>Sales:</strong> Invoice / Sales Order — created, edited, cancelled, voided
+              <strong>Sales (live):</strong> Invoice — created, edited, voided/cancelled
             </li>
             <li>
-              <strong>Customers:</strong> Contact/Customer — created, edited, deleted
+              <strong>Customers (required for live dealers):</strong> Contact/Customer — created, edited,
+              deleted. CRM upserts into <code>dealers</code> / <code>zoho_dealers</code>. If only invoices
+              fire today, add a separate Contact workflow in the Zoho portal — CRM is already ready.
             </li>
           </ul>
         </div>

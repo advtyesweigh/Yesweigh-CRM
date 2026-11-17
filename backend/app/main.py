@@ -7,7 +7,7 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import adms_employees, adms_report, adms_sync
@@ -17,14 +17,18 @@ from app.db import get_db
 from app.employees import router as employees_router
 from app.evolution import router as evolution_router
 from app.inbox import router as inbox_router
+from app.cloud_whatsapp import router as cloud_whatsapp_router
+from app.kerala_district_order import UNKNOWN_RANK, district_rank_whens
 from app.models import AdmsAttendanceLog, Employee, Lead, User, WorkItem
-from app.schemas import DashboardOut, LeadIn, LeadOut, LeadPage, TokenOut, UserOut, WorkIn, WorkOut
+from app.schemas import DashboardOut, LeadIn, LeadOut, LeadPage, LeadUpdate, TokenOut, UserOut, WorkIn, WorkOut
 from app.vps_health import router as vps_health_router
 from app.catalog import router as catalog_router
 from app.dealers import router as dealers_router
 from app.sales_products import router as sales_products_router
 from app.sales_stats import router as sales_stats_router
+from app.pincode import router as pincode_router
 from app.zoho import router as zoho_router
+from app.ai import router as ai_router
 
 settings = get_settings()
 
@@ -32,6 +36,13 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     adms_sync.start_background_sync()
+    # Orphaned AI runs stay "running" forever after API restart — fail them so /work stops polling.
+    try:
+        from app.ai.service import recover_stale_runs_on_startup
+
+        await recover_stale_runs_on_startup()
+    except Exception:  # noqa: BLE001
+        pass
     yield
     await adms_sync.stop_background_sync()
 
@@ -47,12 +58,15 @@ app.add_middleware(
 app.include_router(employees_router)
 app.include_router(evolution_router)
 app.include_router(inbox_router)
+app.include_router(cloud_whatsapp_router)
 app.include_router(vps_health_router)
 app.include_router(zoho_router)
 app.include_router(dealers_router)
 app.include_router(catalog_router)
 app.include_router(sales_products_router)
 app.include_router(sales_stats_router)
+app.include_router(pincode_router)
+app.include_router(ai_router)
 
 Db = Annotated[AsyncSession, Depends(get_db)]
 CurrentUser = Annotated[User, Depends(get_current_user)]
@@ -116,10 +130,14 @@ async def dashboard(db: Db, user: CurrentUser):
 _DISTRICT_ALIASES: dict[str, list[str]] = {
     "kozhikode": ["Kozhikode", "Kozhikkode"],
     "kozhikkode": ["Kozhikode", "Kozhikkode"],
-    "kasaragod": ["Kasaragod", "Kasargod"],
-    "kasargod": ["Kasaragod", "Kasargod"],
+    "kasaragod": ["Kasaragod", "Kasargod", "Kasargode"],
+    "kasargod": ["Kasaragod", "Kasargod", "Kasargode"],
+    "kasargode": ["Kasaragod", "Kasargod", "Kasargode"],
     "pathanamthitta": ["Pathanamthitta", "Pattanamtitta"],
     "pattanamtitta": ["Pathanamthitta", "Pattanamtitta"],
+    "thiruvananthapuram": ["Thiruvananthapuram", "Thiruvanathapuram", "Trivandrum"],
+    "thiruvanathapuram": ["Thiruvananthapuram", "Thiruvanathapuram", "Trivandrum"],
+    "trivandrum": ["Thiruvananthapuram", "Thiruvanathapuram", "Trivandrum"],
 }
 _STATE_ALIASES: dict[str, list[str]] = {
     "uttarakhand": ["Uttarakhand", "Uttaranchal"],
@@ -173,6 +191,7 @@ async def list_leads(
                     Lead.city.ilike(pattern),
                     Lead.district.ilike(pattern),
                     Lead.state.ilike(pattern),
+                    Lead.pin.ilike(pattern),
                 )
             )
         state_vals = _alias_values(state, _STATE_ALIASES)
@@ -202,8 +221,14 @@ async def list_leads(
 
     total = (await db.execute(count_query)).scalar() or 0
     offset = (page - 1) * size
+    # Default: Kerala north→south by district (aliases normalized), then name.
+    district_rank = case(*district_rank_whens(Lead.district), else_=UNKNOWN_RANK)
     rows = (
-        await db.execute(query.order_by(Lead.id.desc()).offset(offset).limit(size))
+        await db.execute(
+            query.order_by(district_rank.asc(), Lead.name.asc(), Lead.id.asc())
+            .offset(offset)
+            .limit(size)
+        )
     ).scalars().all()
     return LeadPage(
         items=rows,
@@ -269,12 +294,20 @@ async def import_leads(body: list[LeadIn], db: Db, user: CurrentUser):
 
 
 @app.patch("/api/leads/{lead_id}", response_model=LeadOut)
-async def update_lead(lead_id: int, body: LeadIn, db: Db, user: CurrentUser):
+async def update_lead(lead_id: int, body: LeadUpdate, db: Db, user: CurrentUser):
     lead = await db.get(Lead, lead_id)
     if not lead:
         raise HTTPException(404, "Lead not found")
-    for k, v in body.model_dump().items():
-        setattr(lead, k, v)
+    data = body.model_dump(exclude_unset=True)
+    if "name" in data or "company" in data:
+        name = data.get("name", lead.name)
+        company = data.get("company", lead.company)
+        if not (name or "").strip() and not (company or "").strip():
+            raise HTTPException(400, "Name or company is required")
+    if "pin" in data and data["pin"] is not None:
+        data["pin"] = "".join(c for c in str(data["pin"]) if c.isdigit())[:20]
+    for k, v in data.items():
+        setattr(lead, k, v if v is not None else "")
     await db.commit()
     await db.refresh(lead)
     return lead

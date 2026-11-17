@@ -8,7 +8,7 @@ from app.config import get_settings
 from app.db import Base, SessionLocal, engine
 from app import models as _models  # noqa: F401 — register all tables on Base.metadata
 from app import models as _models  # noqa: F401 — register tables
-from app.models import User
+from app.models import User, WhatsAppInstance
 
 EMPLOYEE_COLUMNS = {
     "whatsapp": "VARCHAR(40) DEFAULT ''",
@@ -53,17 +53,35 @@ USER_COLUMNS = {
 
 WHATSAPP_CONVERSATION_COLUMNS = {
     "customer_photo": "TEXT DEFAULT ''",
+    "dealer_id": "INTEGER REFERENCES dealers(id)",
+    "ai_outline": "TEXT DEFAULT ''",
+    "ai_outline_at": "TIMESTAMPTZ",
+    "ai_outline_fingerprint": "VARCHAR(80) DEFAULT ''",
+    "customer_lid": "VARCHAR(40) DEFAULT ''",
 }
 
 WHATSAPP_INSTANCE_COLUMNS = {
     "employee_code": "VARCHAR(40) DEFAULT ''",
     "employee_name": "VARCHAR(160) DEFAULT ''",
+    "history_sync_status": "VARCHAR(40) DEFAULT ''",
+    "history_sync_at": "TIMESTAMPTZ",
+    "history_sync_stats": "TEXT DEFAULT ''",
+    "history_sync_error": "TEXT DEFAULT ''",
+    "provider": "VARCHAR(40) DEFAULT 'evolution'",
+}
+
+WHATSAPP_MESSAGE_COLUMNS = {
+    "transcript": "TEXT DEFAULT ''",
+    "transcript_language": "VARCHAR(40) DEFAULT ''",
+    "transcription_status": "VARCHAR(40) DEFAULT ''",
+    "transcription_error": "VARCHAR(255) DEFAULT ''",
 }
 
 LEAD_COLUMNS = {
     "city": "VARCHAR(80) DEFAULT ''",
     "district": "VARCHAR(80) DEFAULT ''",
     "state": "VARCHAR(80) DEFAULT ''",
+    "pin": "VARCHAR(20) DEFAULT ''",
 }
 
 ZOHO_INTEGRATION_COLUMNS = {
@@ -84,6 +102,22 @@ ZOHO_SALE_COLUMNS = {
     "sub_total": "NUMERIC(14,2)",
     # Zoho Books CSV "Sales person" / API salesperson_name
     "salesperson_name": "VARCHAR(160) DEFAULT ''",
+}
+
+AI_USAGE_LOG_COLUMNS = {
+    "conversation_id": "INTEGER REFERENCES whatsapp_conversations(id)",
+    "total_tokens": "INTEGER DEFAULT 0",
+    "thoughts_tokens": "INTEGER DEFAULT 0",
+}
+
+AI_AGENT_RUN_COLUMNS = {
+    "user_deleted": "BOOLEAN DEFAULT FALSE",
+    "assistant_deleted": "BOOLEAN DEFAULT FALSE",
+}
+
+AI_MESSAGE_COLUMNS = {
+    "run_id": "INTEGER REFERENCES ai_agent_runs(id) ON DELETE SET NULL",
+    "deleted_at": "TIMESTAMPTZ",
 }
 
 
@@ -160,6 +194,47 @@ async def ensure_columns(conn, table: str, columns: dict[str, str]) -> None:
             print(f"Added {table}.{name}")
 
 
+async def backfill_outline_usage_employees(conn) -> None:
+    """Fill null employee_id on WhatsApp outline usage from conversation owner."""
+    result = await conn.execute(
+        text(
+            """
+            UPDATE ai_usage_logs u
+            SET employee_id = c.assigned_employee_id
+            FROM whatsapp_conversations c
+            WHERE u.conversation_id = c.id
+              AND u.employee_id IS NULL
+              AND c.assigned_employee_id IS NOT NULL
+              AND (
+                u.purpose = 'whatsapp_outline'
+                OR u.purpose LIKE 'whatsapp_%'
+              )
+            """
+        )
+    )
+    # Fallback: instance primary owner when conversation has no assignee
+    result2 = await conn.execute(
+        text(
+            """
+            UPDATE ai_usage_logs u
+            SET employee_id = ie.employee_id
+            FROM whatsapp_instance_employees ie
+            WHERE u.whatsapp_instance_id = ie.whatsapp_instance_id
+              AND ie.is_primary_owner IS TRUE
+              AND u.employee_id IS NULL
+              AND (
+                u.purpose = 'whatsapp_outline'
+                OR u.purpose LIKE 'whatsapp_%'
+              )
+            """
+        )
+    )
+    n1 = result.rowcount if result.rowcount is not None and result.rowcount >= 0 else 0
+    n2 = result2.rowcount if result2.rowcount is not None and result2.rowcount >= 0 else 0
+    if n1 or n2:
+        print(f"Backfilled outline usage employee_id: {n1} from conversation, {n2} from instance owner")
+
+
 async def normalize_status(conn) -> None:
     await conn.execute(
         text(
@@ -198,6 +273,48 @@ async def ensure_adms_map_index(conn) -> None:
         print(f"Skipped uq_employees_adms_map ({exc})")
 
 
+async def ensure_ai_knowledge_indexes(conn) -> None:
+    """Case-insensitive unique glossary key per org+kind."""
+    try:
+        await conn.execute(
+            text(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_ai_knowledge_org_kind_key_ci
+                ON ai_knowledge (organization_id, kind, lower(key))
+                """
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"Skipped uq_ai_knowledge_org_kind_key_ci ({exc})")
+
+
+async def ensure_whatsapp_inbox_indexes(conn) -> None:
+    """Composite index for account-chip filtered conversation lists."""
+    try:
+        await conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS ix_wa_conv_org_instance_last_msg
+                ON whatsapp_conversations (organization_id, whatsapp_instance_id, last_message_at DESC NULLS LAST)
+                """
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"Skipped ix_wa_conv_org_instance_last_msg ({exc})")
+    try:
+        await conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS ix_wa_conv_org_instance_lid
+                ON whatsapp_conversations (organization_id, whatsapp_instance_id, customer_lid)
+                WHERE customer_lid IS NOT NULL AND customer_lid <> ''
+                """
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"Skipped ix_wa_conv_org_instance_lid ({exc})")
+
+
 async def main() -> None:
     settings = get_settings()
     async with engine.begin() as conn:
@@ -210,13 +327,20 @@ async def main() -> None:
         await ensure_columns(conn, "leads", LEAD_COLUMNS)
         await ensure_columns(conn, "whatsapp_conversations", WHATSAPP_CONVERSATION_COLUMNS)
         await ensure_columns(conn, "whatsapp_instances", WHATSAPP_INSTANCE_COLUMNS)
+        await ensure_columns(conn, "whatsapp_messages", WHATSAPP_MESSAGE_COLUMNS)
         await ensure_columns(conn, "zoho_integrations", ZOHO_INTEGRATION_COLUMNS)
         await ensure_columns(conn, "zoho_oauth_states", ZOHO_OAUTH_STATE_COLUMNS)
         await ensure_columns(conn, "dealers", DEALER_COLUMNS)
         await ensure_columns(conn, "zoho_sales", ZOHO_SALE_COLUMNS)
+        await ensure_columns(conn, "ai_usage_logs", AI_USAGE_LOG_COLUMNS)
+        await ensure_columns(conn, "ai_agent_runs", AI_AGENT_RUN_COLUMNS)
+        await ensure_columns(conn, "ai_messages", AI_MESSAGE_COLUMNS)
+        await backfill_outline_usage_employees(conn)
         await widen_media_url(conn)
         await normalize_status(conn)
         await ensure_adms_map_index(conn)
+        await ensure_whatsapp_inbox_indexes(conn)
+        await ensure_ai_knowledge_indexes(conn)
     async with SessionLocal() as db:
         existing = (await db.execute(select(User).where(User.email == settings.admin_email))).scalar_one_or_none()
         if not existing:
@@ -232,7 +356,90 @@ async def main() -> None:
             print(f"Seeded admin {settings.admin_email}")
         else:
             print("Admin already exists")
+        await ensure_care_instance(db, settings)
     await engine.dispose()
+
+
+CARE_EVO_NAME = "care_meta_cloud"
+CARE_DISPLAY_NAME = "Care"
+
+
+async def ensure_care_instance(db, settings) -> None:
+    """Seed the Meta Cloud WhatsApp line as inbox chip 'Care' (not Evolution)."""
+    import uuid
+
+    from sqlalchemy import or_
+
+    row = (
+        await db.execute(
+            select(WhatsAppInstance).where(
+                WhatsAppInstance.organization_id == "yesweigh",
+                or_(
+                    WhatsAppInstance.evolution_instance_name == CARE_EVO_NAME,
+                    WhatsAppInstance.provider == "meta_cloud",
+                    WhatsAppInstance.display_name == CARE_DISPLAY_NAME,
+                ),
+            )
+        )
+    ).scalars().first()
+    phone_id = (settings.whatsapp_cloud_phone_number_id or "").strip()
+    if row:
+        changed = False
+        if row.provider != "meta_cloud":
+            row.provider = "meta_cloud"
+            changed = True
+        if row.display_name != CARE_DISPLAY_NAME:
+            row.display_name = CARE_DISPLAY_NAME
+            changed = True
+        if row.integration_type != "Meta Cloud API":
+            row.integration_type = "Meta Cloud API"
+            changed = True
+        if row.purpose != "Customer Care":
+            row.purpose = "Customer Care"
+            changed = True
+        if row.deleted_at is not None:
+            row.deleted_at = None
+            changed = True
+        if phone_id and row.evolution_instance_id != phone_id:
+            row.evolution_instance_id = phone_id
+            changed = True
+        # Cloud line is always Connected for chip status (webhook-fed; no QR).
+        if row.connection_status != "Connected":
+            row.connection_status = "Connected"
+            changed = True
+        if changed:
+            await db.commit()
+            print(f"Updated Care WhatsApp instance ({row.public_id})")
+        else:
+            print(f"Care WhatsApp instance already present ({row.public_id})")
+        return
+
+    inst = WhatsAppInstance(
+        public_id=str(uuid.uuid4()),
+        organization_id="yesweigh",
+        integration_id=None,
+        evolution_instance_id=phone_id,
+        evolution_instance_name=CARE_EVO_NAME,
+        encrypted_instance_token="",
+        display_name=CARE_DISPLAY_NAME,
+        employee_code="",
+        employee_name="",
+        expected_phone_number="",
+        connected_phone_number="",
+        profile_name="YesWeigh Care",
+        profile_photo="",
+        integration_type="Meta Cloud API",
+        provider="meta_cloud",
+        department="Customer Care",
+        branch="",
+        purpose="Customer Care",
+        description="YesOne Meta Cloud WhatsApp (service.yesweigh.in /super-admin/whatsapp) — webhook only",
+        connection_status="Connected",
+        registration_status="active",
+    )
+    db.add(inst)
+    await db.commit()
+    print(f"Seeded Care WhatsApp instance ({inst.public_id})")
 
 
 if __name__ == "__main__":
