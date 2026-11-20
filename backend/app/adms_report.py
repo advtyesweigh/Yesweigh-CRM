@@ -6,7 +6,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import httpx
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -163,6 +163,12 @@ def _is_placeholder_display_name(name: str, code: str) -> bool:
 
 
 async def _name_maps(db: AsyncSession, auth: httpx.BasicAuth | None) -> dict[str, str]:
+    """Map biometric enrollment codes → display names.
+
+    CRM contributes names only via ``adms_employee_code`` (never CRM ``code``).
+    Remote / WhatsApp-only staff keep a CRM code for login but must not rename
+    device users that share a numeric enrollment PIN (e.g. Farook=24).
+    """
     names: dict[str, str] = {}
     settings = get_settings()
     try:
@@ -179,32 +185,34 @@ async def _name_maps(db: AsyncSession, auth: httpx.BasicAuth | None) -> dict[str
 
     rows = (
         await db.execute(
-            select(Employee.adms_employee_code, Employee.name, Employee.code).where(
-                or_(Employee.adms_employee_code != "", Employee.code != "")
+            select(Employee.adms_employee_code, Employee.name).where(
+                Employee.adms_employee_code != "",
+                Employee.adms_employee_code.is_not(None),
             )
         )
     ).all()
-    for adms_code, name, code in rows:
+    for adms_code, name in rows:
+        key = str(adms_code or "").strip()
         n = (name or "").strip()
-        if not n:
+        if not key or not n:
             continue
-        keys = [k for k in (str(adms_code or "").strip(), str(code or "").strip()) if k]
-        placeholder = any(_is_placeholder_display_name(n, k) for k in keys) or _is_placeholder_display_name(
-            n, str(adms_code or code or "").strip()
-        )
-        for key in keys:
-            existing = names.get(key)
-            if placeholder:
-                # Never let "Employee N" wipe a real ADMS/device name
-                if not existing:
-                    names[key] = n
-                continue
-            names[key] = n
+        existing = names.get(key)
+        if _is_placeholder_display_name(n, key):
+            # Never let "Employee N" wipe a real ADMS/device name
+            if not existing:
+                names[key] = n
+            continue
+        names[key] = n
     return names
 
 
 async def _known_employee_codes(db: AsyncSession, auth: httpx.BasicAuth | None) -> set[str]:
-    """Union of CRM-mapped + ADMS employee codes for absent/leave roster."""
+    """Biometric roster codes for absent/leave rows.
+
+    CRM contributes only employees with a non-empty ``adms_employee_code``.
+    Falling back to CRM ``code`` incorrectly pulls WhatsApp-only / remote staff
+    (cleared ADMS link) onto the attendance page.
+    """
     from app.adms_employee_exclusions import is_excluded_employee_code
 
     codes: set[str] = set()
@@ -221,20 +229,17 @@ async def _known_employee_codes(db: AsyncSession, auth: httpx.BasicAuth | None) 
         pass
     rows = (
         await db.execute(
-            select(Employee.adms_employee_code, Employee.code, Employee.status).where(
-                Employee.status.in_(["Active", "Probation", "active"])
+            select(Employee.adms_employee_code).where(
+                Employee.status.in_(["Active", "Probation", "active"]),
+                Employee.adms_employee_code != "",
+                Employee.adms_employee_code.is_not(None),
             )
         )
     ).all()
-    for adms_code, code, _status in rows:
-        if adms_code and str(adms_code).strip():
-            c = str(adms_code).strip()
-            if not is_excluded_employee_code(c):
-                codes.add(c)
-        elif code and str(code).strip():
-            c = str(code).strip()
-            if not is_excluded_employee_code(c):
-                codes.add(c)
+    for (adms_code,) in rows:
+        c = str(adms_code or "").strip()
+        if c and not is_excluded_employee_code(c):
+            codes.add(c)
     return codes
 
 

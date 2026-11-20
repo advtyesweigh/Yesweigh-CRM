@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { api } from "../api/client";
+import { api, apiWithTimeout } from "../api/client";
 import AdmsStatusBadge from "../components/AdmsStatusBadge";
 import IndiaSalesMap from "../components/IndiaSalesMap";
 import { sortByStaffDisplayOrder } from "../staffDisplayOrder";
@@ -569,20 +569,32 @@ export default function Dashboard() {
           salesmanRes,
           topDealersRes,
         ] = await Promise.all([
-          api<DashboardOut>("/api/dashboard"),
-          api<LeadPage>("/api/leads?page=1&page_size=1"),
-          api<{ metrics: WaMetrics }>("/api/whatsapp/conversations?limit=1").catch(() => null),
-          api<AdmsDaily>(
-            `/api/integrations/adms/daily?date_from=${today}&date_to=${today}&page=1&page_size=200`
+          // Timeouts so a hung WA/DB query cannot leave "Loading dashboard…" forever.
+          apiWithTimeout<DashboardOut>("/api/dashboard", 15000),
+          apiWithTimeout<LeadPage>("/api/leads?page=1&page_size=1", 15000),
+          apiWithTimeout<{ metrics: WaMetrics }>("/api/whatsapp/conversations?limit=1", 8000).catch(
+            () => null
+          ),
+          apiWithTimeout<AdmsDaily>(
+            `/api/integrations/adms/daily?date_from=${today}&date_to=${today}&page=1&page_size=200`,
+            12000
           ).catch(() => null),
-          api<AdmsDaily>(
-            `/api/integrations/adms/daily?date_from=${weekFrom}&date_to=${today}&page=1&page_size=500`
+          apiWithTimeout<AdmsDaily>(
+            `/api/integrations/adms/daily?date_from=${weekFrom}&date_to=${today}&page=1&page_size=500`,
+            12000
           ).catch(() => null),
-          api<SalesByStateOut>("/api/dealers/sales-by-state").catch(() => null),
-          api<ProductSalesOut>(`/api/dashboard/sales-by-product?year=${year}&limit=10`).catch(() => null),
-          api<SalesOverviewOut>("/api/dashboard/sales-overview").catch(() => null),
-          api<SalesBySalesmanOut>(`/api/dashboard/sales-by-salesman?year=${fyYear}&limit=20`).catch(() => null),
-          api<TopDealersYtdOut>(`/api/dashboard/top-dealers-ytd?year=${fyYear}&limit=6`).catch(() => null),
+          apiWithTimeout<SalesByStateOut>("/api/dealers/sales-by-state", 15000).catch(() => null),
+          apiWithTimeout<ProductSalesOut>(`/api/dashboard/sales-by-product?year=${year}&limit=10`, 15000).catch(
+            () => null
+          ),
+          apiWithTimeout<SalesOverviewOut>("/api/dashboard/sales-overview", 15000).catch(() => null),
+          apiWithTimeout<SalesBySalesmanOut>(
+            `/api/dashboard/sales-by-salesman?year=${fyYear}&limit=20`,
+            15000
+          ).catch(() => null),
+          apiWithTimeout<TopDealersYtdOut>(`/api/dashboard/top-dealers-ytd?year=${fyYear}&limit=6`, 15000).catch(
+            () => null
+          ),
         ]);
 
         if (cancelled) return;

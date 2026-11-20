@@ -8,7 +8,7 @@ import httpx
 from app.evolution_service import EvolutionService
 from app.media_store import save_bytes, save_data_url
 from app.models import WhatsAppConversation
-from app.whatsapp_chat_types import is_group_jid, is_newsletter_jid
+from app.whatsapp_chat_types import is_group_jid, is_newsletter_jid, parse_group_rows
 
 
 def chat_kind_from_jid(jid: str) -> str:
@@ -152,6 +152,43 @@ async def _cache_photo(conv: WhatsAppConversation, url: str) -> str:
         return ""
 
 
+def _group_user(jid: str) -> str:
+    return (jid or "").strip().split("@", 1)[0].split(":", 1)[0]
+
+
+def _looks_digit_stripped_classic_group(jid: str) -> bool:
+    """True when user looks like a mangled classic ``{creator}-{ts}@g.us`` (hyphen stripped).
+
+    Modern groups use ids like ``120363…@g.us`` (no hyphen) — those are valid as-is.
+    """
+    user = _group_user(jid)
+    if not user or "-" in user or not user.isdigit() or len(user) < 18:
+        return False
+    # WhatsApp's newer group ids commonly start with 120363…
+    if user.startswith("120363") or user.startswith("12036"):
+        return False
+    return True
+
+
+async def _resolve_group_jid_from_list(
+    svc: EvolutionService, token: str, jid: str
+) -> tuple[str, str]:
+    """Match digit-stripped / exact @g.us against Evolution group/list → (jid, name)."""
+    want = _digits(_group_user(jid))
+    if not want:
+        return "", ""
+    try:
+        remote = await svc.list_groups(token)
+    except Exception:  # noqa: BLE001
+        return "", ""
+    for row in parse_group_rows(remote):
+        remote_jid = (row.get("jid") or "").strip()
+        if _digits(_group_user(remote_jid)) != want:
+            continue
+        return remote_jid, (row.get("name") or "").strip()[:160]
+    return "", ""
+
+
 async def _avatar_url(svc: EvolutionService, token: str, jid: str) -> str:
     try:
         remote = await svc.get_avatar(token, jid, preview=True)
@@ -213,10 +250,38 @@ async def enrich_conversation_meta(
 
     name = ""
     pic_url = ""
+    resolved_jid = ""
     try:
         if kind == "channel":
             remote = await svc.get_newsletter_info(token, jid)
             name, pic_url = _parse_newsletter_meta(remote if isinstance(remote, dict) else {})
+        elif _looks_digit_stripped_classic_group(jid):
+            # /group/info hangs on mangled creator-ts JIDs; recover hyphen + Name from list.
+            resolved_jid, list_name = await _resolve_group_jid_from_list(svc, token, jid)
+            if list_name:
+                name = list_name
+            info_jid = resolved_jid or jid
+            if (want_photo or not name) and info_jid:
+                try:
+                    remote = await svc.get_group_info(token, info_jid)
+                    info_name, pic_url = _parse_group_meta(
+                        remote if isinstance(remote, dict) else {}
+                    )
+                    name = name or info_name
+                except Exception as info_exc:  # noqa: BLE001
+                    if not name:
+                        reason = str(info_exc)[:300]
+            if want_photo and not pic_url:
+                pic_url = await _avatar_url(svc, token, info_jid)
+            if not name and not pic_url and reason:
+                return {
+                    "ok": False,
+                    "chat_kind": kind,
+                    "customer_name": conv.customer_name or "",
+                    "customer_photo": conv.customer_photo or "",
+                    "changed": False,
+                    "reason": reason,
+                }
         else:
             remote = await svc.get_group_info(token, jid)
             name, pic_url = _parse_group_meta(remote if isinstance(remote, dict) else {})
@@ -232,6 +297,10 @@ async def enrich_conversation_meta(
             "changed": False,
             "reason": reason,
         }
+
+    if resolved_jid and is_group_jid(resolved_jid) and resolved_jid != jid:
+        conv.customer_jid = resolved_jid
+        changed = True
 
     if want_name and name:
         conv.customer_name = name[:160]

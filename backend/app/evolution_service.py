@@ -111,7 +111,10 @@ class EvolutionService:
         digits = "".join(c for c in (phone or "") if c.isdigit())
         if len(digits) < 8:
             raise RuntimeError("Enter a valid phone number with country code")
-        e164 = phone.strip() if (phone or "").strip().startswith("+") else f"+{digits}"
+        # Indian mobiles are often typed as 10 digits without country code.
+        if len(digits) == 10 and digits[0] in "6789":
+            digits = f"91{digits}"
+        e164 = f"+{digits}"
         body = {
             "phone": e164,
             "subscribe": subscribe

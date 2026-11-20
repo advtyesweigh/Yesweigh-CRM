@@ -77,6 +77,29 @@ export async function api<T>(path: string, opts: RequestInit = {}): Promise<T> {
   return res.json();
 }
 
+/** Like api(), but rejects after `ms` so a hung upstream cannot block Promise.all forever. */
+export async function apiWithTimeout<T>(path: string, ms: number, opts: RequestInit = {}): Promise<T> {
+  const ac = new AbortController();
+  const timer = window.setTimeout(() => ac.abort(), Math.max(1, ms));
+  const parent = opts.signal;
+  const onParentAbort = () => ac.abort();
+  if (parent) {
+    if (parent.aborted) ac.abort();
+    else parent.addEventListener("abort", onParentAbort, { once: true });
+  }
+  try {
+    return await api<T>(path, { ...opts, signal: ac.signal });
+  } catch (e) {
+    if (ac.signal.aborted && !(parent && parent.aborted)) {
+      throw new Error(`Request timed out after ${ms}ms`);
+    }
+    throw e;
+  } finally {
+    window.clearTimeout(timer);
+    if (parent) parent.removeEventListener("abort", onParentAbort);
+  }
+}
+
 export async function login(email: string, password: string) {
   const body = new URLSearchParams();
   body.set("username", email);

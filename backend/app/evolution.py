@@ -1667,6 +1667,12 @@ async def _find_conversations_for_peer(
         server = jid.split("@")[1] if "@" in jid else ""
         if user and server:
             clauses.append(WhatsAppConversation.customer_jid == f"{user}@{server}")
+        # Classic "{creator}-{ts}@g.us" may have been stored digit-stripped earlier
+        if server.lower() == "g.us":
+            g_digits = _digits(user)
+            if g_digits and g_digits != user:
+                clauses.append(WhatsAppConversation.customer_jid == f"{g_digits}@g.us")
+                clauses.append(WhatsAppConversation.customer_phone == g_digits)
     if phone and _is_lid_phone(phone):
         clauses.append(WhatsAppConversation.customer_phone == phone)
         clauses.append(WhatsAppConversation.customer_lid == phone)
@@ -2187,12 +2193,14 @@ async def _ingest_webhook_message(
     event_at = fields.get("timestamp") or now
     # Prefer PN as customer_phone / jid; never overwrite PN with LID.
     # Groups keep @g.us — never rewrite to participant @lid / @s.whatsapp.net.
+    # Classic group JIDs are "{creator}-{timestamp}@g.us"; digit-stripping the
+    # user part destroys the hyphen and Evolution group/info can no longer resolve.
     store_phone = fields["phone"]
     store_jid = fields["jid"]
     if is_group or is_group_jid(store_jid):
         g_user = (store_jid.split("@")[0].split(":")[0] if store_jid else "") or store_phone
         store_phone = _digits(g_user) or store_phone
-        store_jid = f"{store_phone}@g.us" if store_phone else store_jid
+        store_jid = f"{g_user}@g.us" if g_user else store_jid
     elif lid_digits and (
         not store_phone
         or store_phone == lid_digits
@@ -2252,11 +2260,22 @@ async def _ingest_webhook_message(
                 conv.customer_phone = store_phone
             if not (conv.customer_jid or "").endswith("@s.whatsapp.net"):
                 conv.customer_jid = f"{store_phone}@s.whatsapp.net"
-        # Ensure group rows keep @g.us even if an older bug wrote something else
-        if is_group and store_jid and not is_group_jid(conv.customer_jid or ""):
-            conv.customer_jid = store_jid
-            conv.customer_phone = store_phone
-            conv.customer_lid = ""
+        # Ensure group rows keep @g.us even if an older bug wrote something else.
+        # Also upgrade digit-stripped classic JIDs back to hyphenated form.
+        if is_group and store_jid and is_group_jid(store_jid):
+            cur_jid = (conv.customer_jid or "").strip()
+            if not is_group_jid(cur_jid):
+                conv.customer_jid = store_jid
+                conv.customer_phone = store_phone
+                conv.customer_lid = ""
+            elif (
+                "-" in store_jid
+                and "-" not in cur_jid
+                and _digits(cur_jid.split("@")[0]) == _digits(store_jid.split("@")[0])
+            ):
+                conv.customer_jid = store_jid
+                conv.customer_phone = store_phone or conv.customer_phone
+                conv.customer_lid = ""
         # Only bump preview/unread for messages newer than (or equal to) last known
         last_at = conv.last_message_at
         if last_at is not None and last_at.tzinfo is None:

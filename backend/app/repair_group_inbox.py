@@ -112,10 +112,9 @@ async def run(*, limit: int = 300) -> dict[str, Any]:
 
     async with SessionLocal() as db:
         _, svc = await _svc(db)
-        # Id-first then fetch one-by-one — full payload SELECT of hundreds OOMs the API box.
-        id_rows = (
+        rows = (
             await db.execute(
-                select(EvolutionWebhookEvent.id)
+                select(EvolutionWebhookEvent)
                 .where(
                     EvolutionWebhookEvent.event_type.in_(["Message", "message", "messages.upsert"]),
                     EvolutionWebhookEvent.payload.ilike("%@g.us%"),
@@ -123,13 +122,7 @@ async def run(*, limit: int = 300) -> dict[str, Any]:
                 .order_by(EvolutionWebhookEvent.id.desc())
                 .limit(limit)
             )
-        ).all()
-        event_ids = [r[0] for r in id_rows]
-        rows = []
-        for eid in event_ids:
-            ev = await db.get(EvolutionWebhookEvent, eid)
-            if ev:
-                rows.append(ev)
+        ).scalars().all()
 
         inst_cache: dict[int, WhatsAppInstance | None] = {}
 

@@ -198,8 +198,7 @@ export default function EvolutionSettings() {
     setLinkMode("qr");
     setPairingCode("");
     setPairError("");
-    const row = items.find((i) => i.id === id);
-    setPairPhone((row?.expected_phone_number || row?.connected_phone_number || "").replace(/^\+/, ""));
+    setPairPhone("");
     try {
       const qr = await api<Record<string, unknown>>(`/api/whatsapp/instances/${id}/qrcode`);
       setQrData(qr);
@@ -444,7 +443,9 @@ export default function EvolutionSettings() {
                             <div>
                               <b>{i.display_name}</b>
                               <small>
-                                {i.employee_code ? `Code ${i.employee_code}` : i.purpose}
+                                {i.employee_code
+                                  ? `Code ${i.employee_code}`
+                                  : i.branch || i.purpose}
                                 {i.assignees[0]?.name && i.assignees[0].name !== i.display_name
                                   ? ` · ${i.assignees[0].name}`
                                   : ""}
@@ -636,7 +637,7 @@ export default function EvolutionSettings() {
                       id="evo-pair-phone"
                       type="tel"
                       inputMode="tel"
-                      placeholder="919876543210"
+                      placeholder=""
                       value={pairPhone}
                       onChange={(e) => setPairPhone(e.target.value)}
                       autoComplete="tel"

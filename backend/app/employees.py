@@ -286,7 +286,7 @@ async def employee_options(user: CurrentUser):
             "Warehouse",
             "Administration",
         ],
-        "branches": ["Head Office", "Kochi", "Chennai", "Bengaluru"],
+        "branches": ["Head Office", "North East", "Kochi", "Chennai", "Bengaluru", "Remote"],
         "statuses": [
             "Active",
             "Probation",

@@ -72,24 +72,19 @@ def _named_group_filter():
 
 
 def _lid_orphan_hidden_filter():
-    """Hide @lid shells when a PN row on the same instance already stores this LID."""
+    """SQL predicate: hide @lid shells that already have a PN twin (same customer_lid).
+
+    Prefer ``_drop_lid_orphans`` for list endpoints — this correlated EXISTS is too
+    expensive under ORDER BY + LIMIT / COUNT on ~8k rows.
+    """
     twin = aliased(WhatsAppConversation)
-    self_lid = func.coalesce(
-        func.nullif(func.trim(WhatsAppConversation.customer_lid), ""),
-        func.nullif(
-            func.regexp_replace(
-                func.split_part(WhatsAppConversation.customer_jid, "@", 1),
-                r":.*$",
-                "",
-            ),
-            "",
-        ),
-    )
+    self_lid = func.nullif(func.trim(WhatsAppConversation.customer_lid), "")
     twin_is_pn = or_(
         twin.customer_jid.ilike("%@s.whatsapp.net"),
         and_(
             ~twin.customer_jid.ilike("%@lid"),
-            func.length(func.regexp_replace(twin.customer_phone, r"\D", "", "g")).between(10, 15),
+            ~twin.customer_jid.ilike("%@g.us"),
+            ~twin.customer_jid.ilike("%@newsletter"),
         ),
     )
     has_pn_twin = (
@@ -100,13 +95,61 @@ def _lid_orphan_hidden_filter():
             twin.id != WhatsAppConversation.id,
             twin_is_pn,
             self_lid.is_not(None),
-            self_lid != "",
             twin.customer_lid == self_lid,
+            twin.customer_lid != "",
         )
         .correlate(WhatsAppConversation)
         .exists()
     )
-    return ~and_(WhatsAppConversation.customer_jid.ilike("%@lid"), has_pn_twin)
+    return ~and_(
+        WhatsAppConversation.customer_jid.ilike("%@lid"),
+        self_lid.is_not(None),
+        has_pn_twin,
+    )
+
+
+async def _drop_lid_orphans(
+    db: AsyncSession, rows: list[WhatsAppConversation]
+) -> list[WhatsAppConversation]:
+    """Drop @lid rows that already have a non-@lid twin with the same customer_lid.
+
+    Runs a small IN-list lookup on the page only — keeps inbox list <2s.
+    """
+    candidates = [
+        r
+        for r in rows
+        if "@lid" in (r.customer_jid or "").lower() and (r.customer_lid or "").strip()
+    ]
+    if not candidates:
+        return rows
+
+    lids_by_inst: dict[int, set[str]] = {}
+    for r in candidates:
+        lids_by_inst.setdefault(r.whatsapp_instance_id, set()).add((r.customer_lid or "").strip())
+
+    twin_keys: set[tuple[int, str]] = set()
+    for inst_id, lids in lids_by_inst.items():
+        twin_rows = (
+            await db.execute(
+                select(WhatsAppConversation.whatsapp_instance_id, WhatsAppConversation.customer_lid).where(
+                    WhatsAppConversation.whatsapp_instance_id == inst_id,
+                    WhatsAppConversation.customer_lid.in_(list(lids)),
+                    WhatsAppConversation.customer_lid != "",
+                    ~WhatsAppConversation.customer_jid.ilike("%@lid"),
+                )
+            )
+        ).all()
+        for iid, lid in twin_rows:
+            twin_keys.add((int(iid), (lid or "").strip()))
+
+    out: list[WhatsAppConversation] = []
+    for r in rows:
+        jid = (r.customer_jid or "").lower()
+        lid = (r.customer_lid or "").strip()
+        if "@lid" in jid and lid and (r.whatsapp_instance_id, lid) in twin_keys:
+            continue
+        out.append(r)
+    return out
 
 
 def _is_admin(user: User) -> bool:
@@ -525,10 +568,11 @@ async def list_conversations(
     if allowed is not None and not allowed:
         return {"items": [], "total": 0, "metrics": _empty_metrics()}
 
+    # Do NOT apply ``_lid_orphan_hidden_filter`` here — correlated EXISTS + ORDER BY
+    # forces a multi-second nested loop even with LIMIT. Drop orphans after fetch.
     stmt = select(WhatsAppConversation).where(
         WhatsAppConversation.organization_id == ORG,
         newsletter_list_filter(),
-        _lid_orphan_hidden_filter(),
     )
     if allowed is not None:
         stmt = stmt.where(WhatsAppConversation.whatsapp_instance_id.in_(allowed))
@@ -601,8 +645,10 @@ async def list_conversations(
     else:
         stmt = stmt.order_by(activity.desc().nullslast())
 
-    # Skip exact COUNT(*) — inbox FE does not paginate by total; saves a full scan per chip toggle.
-    rows = (await db.execute(stmt.offset(offset).limit(limit))).scalars().all()
+    # Over-fetch then drop @lid orphans in Python so page still fills to ``limit``.
+    fetch_limit = min(max(limit + 40, limit), 200)
+    rows = (await db.execute(stmt.offset(offset).limit(fetch_limit))).scalars().all()
+    rows = (await _drop_lid_orphans(db, rows))[:limit]
     total = offset + len(rows)
 
     inst_ids = {r.whatsapp_instance_id for r in rows}
@@ -652,46 +698,58 @@ def _empty_metrics() -> dict[str, Any]:
 
 
 async def _metrics(db: AsyncSession, allowed: list[int] | None) -> dict[str, Any]:
-    base = select(WhatsAppConversation).where(
+    """Inbox badge counts.
+
+    Intentionally omits ``_lid_orphan_hidden_filter`` — that correlated EXISTS
+    (regexp + twin scan) turns each COUNT into a multi-second table scan on
+    ~8k rows and blocked the whole conversations list for ~20–35s. Lid orphans
+    are still hidden in the list query (LIMIT makes that cheap); badge drift
+    of a few rows is acceptable.
+    """
+    if allowed is not None and not allowed:
+        return _empty_metrics()
+
+    scope = [
         WhatsAppConversation.organization_id == ORG,
         newsletter_list_filter(),
-        _lid_orphan_hidden_filter(),
-    )
+    ]
     if allowed is not None:
-        if not allowed:
-            return _empty_metrics()
-        base = base.where(WhatsAppConversation.whatsapp_instance_id.in_(allowed))
-    open_q = base.where(WhatsAppConversation.status != "Resolved")
-    open_n = (await db.execute(select(func.count()).select_from(open_q.subquery()))).scalar() or 0
+        scope.append(WhatsAppConversation.whatsapp_instance_id.in_(allowed))
+
+    open_n = (
+        await db.execute(
+            select(func.count())
+            .select_from(WhatsAppConversation)
+            .where(*scope, WhatsAppConversation.status != "Resolved")
+        )
+    ).scalar() or 0
     unread_n = (
         await db.execute(
-            select(func.coalesce(func.sum(WhatsAppConversation.unread_count), 0)).where(
-                WhatsAppConversation.organization_id == ORG,
-                newsletter_list_filter(),
-                *([] if allowed is None else [WhatsAppConversation.whatsapp_instance_id.in_(allowed)]),
-            )
+            select(func.coalesce(func.sum(WhatsAppConversation.unread_count), 0)).where(*scope)
         )
     ).scalar() or 0
     unassigned_n = (
         await db.execute(
-            select(func.count()).select_from(
-                open_q.where(
-                    WhatsAppConversation.assigned_employee_id.is_(None),
-                    WhatsAppConversation.assigned_user_id.is_(None),
-                ).subquery()
+            select(func.count())
+            .select_from(WhatsAppConversation)
+            .where(
+                *scope,
+                WhatsAppConversation.status != "Resolved",
+                WhatsAppConversation.assigned_employee_id.is_(None),
+                WhatsAppConversation.assigned_user_id.is_(None),
             )
+        )
+    ).scalar() or 0
+    unread_convs = (
+        await db.execute(
+            select(func.count())
+            .select_from(WhatsAppConversation)
+            .where(*scope, WhatsAppConversation.unread_count > 0)
         )
     ).scalar() or 0
     agents_total = (
         await db.execute(
             select(func.count()).select_from(Employee).where(Employee.status.in_(["Active", "Probation"]))
-        )
-    ).scalar() or 0
-    unread_convs = (
-        await db.execute(
-            select(func.count()).select_from(
-                base.where(WhatsAppConversation.unread_count > 0).subquery()
-            )
         )
     ).scalar() or 0
     return {
@@ -1243,7 +1301,9 @@ async def _send_and_store(
         conv.last_message_preview = (text or media_name or "[attachment]")[:255]
     conv.last_message_at = now
     # Outbound reply from CRM = conversation is being handled → clear unread/New
+    # (Opening/viewing a chat must NOT clear unread — only a successful staff reply.)
     clear_conversation_unread(conv)
+    await _send_whatsapp_read_receipts(db, conv, inst)
     if conv.status in {"Pending Customer Reply", "Resolved"}:
         conv.status = "Open"
     if not conv.assigned_employee_id:
@@ -1289,41 +1349,52 @@ async def add_note(public_id: str, body: NoteIn, db: Db, user: CurrentUser):
     return _msg_out(msg)
 
 
-@router.post("/api/whatsapp/conversations/{public_id}/read")
-async def mark_read(public_id: str, db: Db, user: CurrentUser):
-    """Mark conversation read when an agent opens it in CRM (or after reply)."""
-    conv = await _get_conversation(db, public_id, user)
-    clear_conversation_unread(conv)
-
-    # Best-effort WhatsApp read receipts via Evolution (does not block CRM read).
+async def _send_whatsapp_read_receipts(
+    db: AsyncSession,
+    conv: WhatsAppConversation,
+    inst: WhatsAppInstance | None = None,
+) -> None:
+    """Best-effort WhatsApp blue-tick receipts (Evolution). Never raises."""
     try:
-        inst = await db.get(WhatsAppInstance, conv.whatsapp_instance_id)
+        if inst is None:
+            inst = await db.get(WhatsAppInstance, conv.whatsapp_instance_id)
         recipient = _send_recipient(conv)
-        if inst and recipient:
-            recent_in = (
-                await db.execute(
-                    select(WhatsAppMessage.external_message_id)
-                    .where(
-                        WhatsAppMessage.conversation_id == conv.id,
-                        WhatsAppMessage.direction == "in",
-                        WhatsAppMessage.external_message_id != "",
-                    )
-                    .order_by(WhatsAppMessage.created_at.desc())
-                    .limit(20)
+        if not inst or not recipient:
+            return
+        recent_in = (
+            await db.execute(
+                select(WhatsAppMessage.external_message_id)
+                .where(
+                    WhatsAppMessage.conversation_id == conv.id,
+                    WhatsAppMessage.direction == "in",
+                    WhatsAppMessage.external_message_id != "",
                 )
-            ).scalars().all()
-            ids = [mid for mid in recent_in if mid]
-            if ids:
-                _, svc = await _svc(db)
-                token = decrypt_secret(inst.encrypted_instance_token)
-                await svc.mark_read(token, recipient, ids)
+                .order_by(WhatsAppMessage.created_at.desc())
+                .limit(20)
+            )
+        ).scalars().all()
+        ids = [mid for mid in recent_in if mid]
+        if not ids:
+            return
+        _, svc = await _svc(db)
+        token = decrypt_secret(inst.encrypted_instance_token)
+        await svc.mark_read(token, recipient, ids)
     except Exception:  # noqa: BLE001
         pass
 
-    await db.commit()
+
+@router.post("/api/whatsapp/conversations/{public_id}/read")
+async def mark_read(public_id: str, db: Db, user: CurrentUser):
+    """No-op for CRM unread/status.
+
+    Opening a chat must not clear unread or flip New→Open. Unread clears only when
+    staff successfully sends a reply (`_send_and_store` → `clear_conversation_unread`).
+    Kept for backward-compatible clients; returns current conversation state.
+    """
+    conv = await _get_conversation(db, public_id, user)
     return {
         "ok": True,
-        "unread_count": 0,
+        "unread_count": int(conv.unread_count or 0),
         "status": conv.status,
         "tag": conv.tag or ("New" if conv.status == "New" else conv.status),
     }

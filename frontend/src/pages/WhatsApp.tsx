@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent as ReactMouseEvent } from "react";
-import { api } from "../api/client";
+import { api, apiWithTimeout } from "../api/client";
 import RightPanel from "../components/whatsapp/RightPanel";
 import type { AiSummary } from "../components/whatsapp/AiSummaryCard";
 import { SearchIcon } from "../components/whatsapp/icons";
@@ -440,9 +440,11 @@ export default function WhatsApp() {
     if (accountId !== "all") params.set("instance_id", accountId);
 
     try {
-      const res = await api<{ items: Conv[]; metrics: Metrics }>(`/api/whatsapp/conversations?${params}`, {
-        signal: ac.signal,
-      });
+      const res = await apiWithTimeout<{ items: Conv[]; metrics: Metrics }>(
+        `/api/whatsapp/conversations?${params}`,
+        15000,
+        { signal: ac.signal }
+      );
       if (ac.signal.aborted || gen !== listGenRef.current) return;
 
       listCacheRef.current.set(key, { items: res.items, metrics: res.metrics });
@@ -505,7 +507,9 @@ export default function WhatsApp() {
       if (e instanceof Error && e.name === "AbortError") return;
       throw e;
     } finally {
-      if (!ac.signal.aborted && gen === listGenRef.current) {
+      // Always clear loading for the latest generation — aborted predecessors must not
+      // leave the inbox stuck on "Loading…" when a newer request also fails/aborts.
+      if (gen === listGenRef.current) {
         setLoading(false);
         setListRefreshing(false);
       }
@@ -558,32 +562,8 @@ export default function WhatsApp() {
           .catch(() => null);
       }, 3500);
     }
-    const readRes = await api<{ ok?: boolean; unread_count?: number; status?: string; tag?: string }>(
-      `/api/whatsapp/conversations/${id}/read`,
-      { method: "POST", body: "{}" },
-    ).catch(() => null);
-    // Optimistic local clear so New / unread badge + header totals update immediately
-    setItems((prev) => {
-      let cleared = 0;
-      const next = prev.map((x) => {
-        if (x.id !== id) return x;
-        cleared = x.unread_count || 0;
-        const status = readRes?.status || (x.status === "New" ? "Open" : x.status);
-        const tag =
-          readRes?.tag ||
-          ((x.tag || "").toLowerCase() === "new" ? status : x.tag || status);
-        return { ...x, unread_count: 0, status, tag };
-      });
-      if (cleared > 0) {
-        setMetrics((m) => ({
-          ...m,
-          unread: Math.max(0, (m.unread || 0) - cleared),
-          unread_conversations: Math.max(0, (m.unread_conversations || 0) - 1),
-        }));
-        loadAccounts().catch(() => null);
-      }
-      return next;
-    });
+    // Do NOT mark read / clear unread / flip New→Open on open or message fetch.
+    // Unread + New stay until staff successfully sends a reply (backend clear_conversation_unread).
     // Refresh DP / group-channel title when opening a chat
     const conv = items.find((c) => c.id === id);
     const groupish = Boolean(conv && (conv.is_group || conv.is_channel || conv.chat_kind === "group" || conv.chat_kind === "channel"));
