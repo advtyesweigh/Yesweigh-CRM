@@ -162,6 +162,79 @@ async def sync_once(*, max_batches: int = 50) -> dict[str, Any]:
         }
 
 
+_offline_alerted: set[str] = set()
+
+
+async def _check_offline_alert() -> None:
+    """Log / webhook once when gateway is up but device stays offline past threshold."""
+    settings = get_settings()
+    threshold = max(60, int(settings.adms_offline_alert_seconds))
+    try:
+        async with httpx.AsyncClient(timeout=5.0, auth=_auth()) as client:
+            hr = await client.get(f"{settings.adms_base_url}/health")
+            if not hr.is_success:
+                return
+            dr = await client.get(f"{settings.adms_base_url}/api/devices")
+            if not dr.is_success:
+                return
+            body = dr.json()
+            rows = body if isinstance(body, list) else []
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("ADMS offline check skipped: %s", exc)
+        return
+
+    now = datetime.now(timezone.utc)
+    for d in rows:
+        serial = str(d.get("serial_number") or "")
+        if not serial or serial.upper() == "TEST" or d.get("status") == "disabled":
+            continue
+        if d.get("online"):
+            _offline_alerted.discard(serial)
+            continue
+        hb = d.get("last_heartbeat_at") or ""
+        age_s = d.get("seconds_since_last_seen")
+        if age_s is None and hb:
+            try:
+                ts = datetime.fromisoformat(str(hb).replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                age_s = int((now - ts).total_seconds())
+            except ValueError:
+                continue
+        if age_s is None or int(age_s) < threshold:
+            continue
+        if serial in _offline_alerted:
+            continue
+        _offline_alerted.add(serial)
+        hint = str(d.get("recovery_hint") or "").strip() or (
+            "Toggle Cloud/ADMS on panel or power-cycle; confirm http://103.176.85.102:8081"
+        )
+        logger.warning(
+            "ADMS_DEVICE_SILENT serial=%s offline_for=%ss needs_onsite=%s — %s",
+            serial,
+            age_s,
+            bool(d.get("needs_onsite")),
+            hint,
+        )
+        url = (settings.adms_offline_alert_webhook_url or "").strip()
+        if not url:
+            continue
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                await client.post(
+                    url,
+                    json={
+                        "event": "crm.adms_device_silent",
+                        "serial": serial,
+                        "age_seconds": age_s,
+                        "last_heartbeat_at": hb,
+                        "recovery": hint,
+                    },
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ADMS offline webhook failed: %s", exc)
+
+
 async def _loop() -> None:
     settings = get_settings()
     # Drain backlog quickly on boot
@@ -176,6 +249,11 @@ async def _loop() -> None:
                 result["after_id"],
                 result["pg_total"],
             )
+        # Offline watch shares the sync cadence (no extra process)
+        try:
+            await _check_offline_alert()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("ADMS offline watch error: %s", exc)
         # If still catching up, loop immediately
         remote = result.get("remote_total")
         pg = result.get("pg_total") or 0

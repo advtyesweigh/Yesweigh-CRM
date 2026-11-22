@@ -1181,9 +1181,15 @@ body.wa-col-dragging { cursor: col-resize; user-select: none; }
 .wa-transcript {
   padding: 2px 10px 6px; max-width: min(280px, 78vw);
 }
-.wa-transcript-text {
-  margin: 0; font-size: 13px; line-height: 1.4; color: #111b21; white-space: pre-wrap;
+.wa-translation {
+  border-top: 1px solid #e9edef; margin-top: 2px; padding-top: 6px;
 }
+/* Destination language (Malayalam) — always blue so staff can spot translations */
+.wa-transcript-text {
+  margin: 0; font-size: 13px; line-height: 1.45; color: #1565c0; white-space: pre-wrap;
+  font-weight: 500;
+}
+.wa-msg.out .wa-transcript-text { color: #0d47a1; }
 .wa-transcript-status {
   margin: 0; font-size: 12px; color: #667781; font-style: italic;
 }
@@ -1634,8 +1640,14 @@ body.wa-col-dragging { cursor: col-resize; user-select: none; }
   flex-shrink: 0;
 }
 .adms-status-badge.online .adms-status-dot { background: #12a06a; }
+.adms-status-badge.unstable .adms-status-dot { background: #d97706; }
 .adms-status-badge.offline .adms-status-dot { background: #c9334a; }
 .adms-status-badge.pending .adms-status-dot { background: #94a3b8; }
+.adms-status-badge .pill.amber {
+  background: #fff7ed;
+  color: #9a3412;
+  border: 1px solid #fed7aa;
+}
 .adms-sync-msg {
   margin: 10px 0 0;
   font-size: 13px;

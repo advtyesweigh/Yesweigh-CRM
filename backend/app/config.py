@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     adms_sync_enabled: bool = True
     adms_sync_interval_seconds: int = 20
     adms_sync_batch_size: int = 500
+    # Warn in CRM logs when ADMS device stays offline this long (seconds).
+    adms_offline_alert_seconds: int = 300
+    # Optional webhook for prolonged ADMS offline (empty = log-only).
+    adms_offline_alert_webhook_url: str = ""
     # Fallback env knobs; live report uses Mon–Fri 09:30–17:30 / Sat 09:30–17:00 / Sun off.
     adms_shift_start: str = "09:30"
     adms_shift_end: str = "17:30"
@@ -72,6 +76,12 @@ class Settings(BaseSettings):
     sarvam_api_key: str = ""
     sarvam_base_url: str = "https://api.sarvam.ai"
     sarvam_stt_model: str = "saaras:v3"
+    # STT mode: transcribe (native script) | translate (English only) | verbatim | translit | codemix
+    sarvam_stt_mode: str = "transcribe"
+    # After STT, translate displayed transcript into this BCP-47 code (e.g. ml-IN). Empty = keep source.
+    sarvam_transcript_target_language: str = "ml-IN"
+    # Text translation model for the post-STT step (mayura:v1 or sarvam-translate:v1).
+    sarvam_translate_model: str = "mayura:v1"
     # Care = YesOne Meta Cloud WhatsApp (service.yesweigh.in). Secrets via env only.
     care_webhook_secret: str = ""
     # Meta hub.verify_token for /api/webhooks/meta-whatsapp (optional; else fetched from YesOne).

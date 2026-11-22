@@ -378,11 +378,28 @@ def _filter_real_devices(rows: list[dict]) -> list[dict]:
     return [d for d in rows if not _is_local_or_test_device(d)]
 
 
+def _adms_connection_status(d: dict) -> str:
+    """Normalize ADMS Online / Unstable / Offline (prefer explicit connection_status)."""
+    raw = str(d.get("connection_status") or "").strip()
+    if raw in ("Online", "Unstable", "Offline"):
+        return raw
+    if d.get("unstable"):
+        return "Unstable"
+    if d.get("online"):
+        return "Online"
+    return "Offline"
+
+
 def _device_counts(rows: list[dict]) -> dict:
     return {
         "total": len(rows),
-        "online": sum(1 for d in rows if d.get("online")),
-        "offline": sum(1 for d in rows if not d.get("online") and d.get("status") != "disabled"),
+        "online": sum(1 for d in rows if _adms_connection_status(d) == "Online"),
+        "unstable": sum(1 for d in rows if _adms_connection_status(d) == "Unstable"),
+        "offline": sum(
+            1
+            for d in rows
+            if _adms_connection_status(d) == "Offline" and d.get("status") != "disabled"
+        ),
         "pending_approval": sum(1 for d in rows if d.get("status") == "pending"),
         "approved": sum(1 for d in rows if d.get("status") == "approved"),
     }
@@ -416,41 +433,56 @@ def _format_ist_last_online(raw: str | None) -> str | None:
 
 
 def _pick_primary_device(active: list[dict]) -> dict | None:
-    """Prefer an online device; else the one with the most recent heartbeat."""
+    """Prefer Online, then Unstable, else most recent heartbeat."""
     if not active:
         return None
-    online = [d for d in active if d.get("online")]
-    pool = online or active
 
-    def _hb_key(d: dict):
+    def _rank(d: dict) -> tuple:
+        st = _adms_connection_status(d)
+        tier = 0 if st == "Online" else (1 if st == "Unstable" else 2)
         ts = _parse_heartbeat_utc(d.get("last_heartbeat_at") or "")
-        return ts.timestamp() if ts else 0.0
+        return (tier, -(ts.timestamp() if ts else 0.0))
 
-    return max(pool, key=_hb_key)
+    return min(active, key=_rank)
 
 
 @app.get("/api/integrations/adms/health")
 async def adms_health(user: CurrentUser):
-    """Online only when ADMS gateway is up AND at least one real device has a recent heartbeat.
+    """Online only when ADMS gateway is up AND at least one real device is Online.
 
-    ADMS marks a device online when last_heartbeat_at is within device_offline_seconds
-    (default 180s). Gateway /health alone is not enough — the ZK unit can be offline
-    while the listener still answers.
+    ADMS thresholds (Delay=15): Online ≤45s, Unstable 45–120s, Offline >120s.
+    Unstable is reported separately — do not treat it as binary Offline in the UI.
+    Gateway /health alone is not enough — the ZK unit can be offline while the
+    listener still answers.
     """
     gateway_ok = False
     status_code: int | None = None
     devices_online = 0
+    devices_unstable = 0
     devices_total = 0
     primary: dict | None = None
     last_online_at = ""
     last_online_ist: str | None = None
+    connection_status = "Offline"
     error: str | None = None
+    thresholds: dict | None = None
 
     try:
         async with httpx.AsyncClient(timeout=4.0, auth=_adms_auth()) as client:
             r = await client.get(f"{settings.adms_base_url}/health")
             gateway_ok = r.is_success
             status_code = r.status_code
+            if gateway_ok:
+                try:
+                    h = r.json()
+                    if isinstance(h, dict):
+                        thresholds = h.get("thresholds") if isinstance(h.get("thresholds"), dict) else {
+                            "online_seconds": h.get("device_online_seconds"),
+                            "offline_seconds": h.get("device_offline_seconds"),
+                            "unstable_band": f"{h.get('device_online_seconds')}-{h.get('device_offline_seconds')}s",
+                        }
+                except Exception:  # noqa: BLE001
+                    thresholds = None
 
             if gateway_ok:
                 dr = await client.get(f"{settings.adms_base_url}/api/devices")
@@ -460,20 +492,26 @@ async def adms_health(user: CurrentUser):
                     # Prefer approved / non-disabled; still count pending with heartbeat
                     active = [d for d in rows if d.get("status") != "disabled"]
                     devices_total = len(active)
-                    online_devs = [d for d in active if d.get("online")]
+                    online_devs = [d for d in active if _adms_connection_status(d) == "Online"]
+                    unstable_devs = [d for d in active if _adms_connection_status(d) == "Unstable"]
                     devices_online = len(online_devs)
+                    devices_unstable = len(unstable_devs)
                     pick = _pick_primary_device(active)
                     if pick:
                         hb = str(pick.get("last_heartbeat_at") or pick.get("last_seen") or "")
                         last_online_at = hb
                         last_online_ist = _format_ist_last_online(hb)
+                        connection_status = _adms_connection_status(pick)
                         primary = {
                             "serial": pick.get("serial_number") or "",
                             "name": pick.get("name") or pick.get("serial_number") or "",
-                            "online": bool(pick.get("online")),
+                            "online": connection_status == "Online",
+                            "unstable": connection_status == "Unstable",
+                            "connection_status": connection_status,
                             "last_heartbeat_at": hb,
                             "last_online_ist": last_online_ist or "",
                             "status": pick.get("status") or "",
+                            "seconds_since_last_seen": pick.get("seconds_since_last_seen"),
                         }
                 else:
                     error = f"devices status {dr.status_code}"
@@ -482,16 +520,62 @@ async def adms_health(user: CurrentUser):
         gateway_ok = False
 
     device_online = devices_online > 0
+    device_unstable = (not device_online) and devices_unstable > 0
+    if device_online:
+        connection_status = "Online"
+    elif device_unstable:
+        connection_status = "Unstable"
+    elif not primary:
+        connection_status = "Offline"
     ok = gateway_ok and device_online
+    offline_for_seconds: int | None = None
+    needs_onsite = False
+    recovery_hint = ""
+    if connection_status == "Unstable" and last_online_at:
+        ts = _parse_heartbeat_utc(last_online_at)
+        if ts is not None:
+            from datetime import datetime, timezone
+
+            offline_for_seconds = int((datetime.now(timezone.utc) - ts).total_seconds())
+        recovery_hint = (
+            "Device heartbeat is stale (Unstable 45–120s). Waiting for next getrequest / "
+            "ErrorDelay retry — not yet Offline."
+        )
+    elif not ok and last_online_at:
+        ts = _parse_heartbeat_utc(last_online_at)
+        if ts is not None:
+            from datetime import datetime, timezone
+
+            offline_for_seconds = int((datetime.now(timezone.utc) - ts).total_seconds())
+            if offline_for_seconds >= int(settings.adms_offline_alert_seconds):
+                needs_onsite = True
+                recovery_hint = (
+                    "Device stopped heartbeating. Toggle Cloud/ADMS on the biometric panel "
+                    "or power-cycle it; confirm it can reach http://103.176.85.102:8081."
+                )
+            else:
+                recovery_hint = (
+                    "Gateway is up; waiting for the device ErrorDelay retry / next getrequest "
+                    "(usually within ~30–120s after a blip)."
+                )
+    elif not gateway_ok:
+        recovery_hint = "ADMS gateway unreachable — check adms.service on the VPS."
     return {
         "ok": ok,
         "gateway_ok": gateway_ok,
         "device_online": device_online,
+        "device_unstable": device_unstable,
+        "connection_status": connection_status,
         "devices_online": devices_online,
+        "devices_unstable": devices_unstable,
         "devices_total": devices_total,
         "primary": primary,
         "last_online_at": last_online_at,
         "last_online_ist": last_online_ist,
+        "offline_for_seconds": offline_for_seconds,
+        "needs_onsite": needs_onsite,
+        "recovery_hint": recovery_hint,
+        "thresholds": thresholds,
         "status_code": status_code,
         "url": settings.adms_base_url,
         **({"error": error} if error else {}),

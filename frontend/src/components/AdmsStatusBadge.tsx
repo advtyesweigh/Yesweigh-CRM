@@ -1,18 +1,26 @@
 import { useEffect, useState } from "react";
-import { api } from "../api/client";
+import { apiWithTimeout } from "../api/client";
 
 type AdmsHealth = {
   ok: boolean;
   gateway_ok?: boolean;
   device_online?: boolean;
+  device_unstable?: boolean;
+  connection_status?: "Online" | "Unstable" | "Offline" | string;
   devices_online?: number;
+  devices_unstable?: number;
   devices_total?: number;
   last_online_at?: string;
   last_online_ist?: string;
+  offline_for_seconds?: number | null;
+  needs_onsite?: boolean;
+  recovery_hint?: string;
   primary?: {
     serial?: string;
     name?: string;
     online?: boolean;
+    unstable?: boolean;
+    connection_status?: string;
     last_heartbeat_at?: string;
     last_online_ist?: string;
   } | null;
@@ -26,6 +34,8 @@ type Props = {
   size?: number;
   className?: string;
 };
+
+type Tone = "online" | "unstable" | "offline" | "pending";
 
 /** Format ADMS heartbeat as dd/mm/yyyy HH:mm in Asia/Kolkata. */
 function formatLastOnlineIst(iso?: string | null, preformatted?: string | null): string {
@@ -59,12 +69,23 @@ function formatLastOnlineIst(iso?: string | null, preformatted?: string | null):
 }
 
 function offlineLabel(when: string): string {
-  // Exact format requested: Offline · dd/mm/yyyy HH:mm
   return when ? `Offline · ${when}` : "Offline";
 }
 
+function resolveTone(res: AdmsHealth): Tone {
+  if (res.ok || res.connection_status === "Online" || res.device_online) return "online";
+  if (
+    res.connection_status === "Unstable" ||
+    res.device_unstable ||
+    (res.devices_unstable ?? 0) > 0
+  ) {
+    return "unstable";
+  }
+  return "offline";
+}
+
 export default function AdmsStatusBadge({ size = 32, className = "" }: Props) {
-  const [online, setOnline] = useState<boolean | null>(null);
+  const [tone, setTone] = useState<Tone>("pending");
   const [label, setLabel] = useState("Checking…");
   const [hint, setHint] = useState("ADMS");
 
@@ -74,7 +95,8 @@ export default function AdmsStatusBadge({ size = 32, className = "" }: Props) {
 
     const tick = async () => {
       try {
-        const res = await api<AdmsHealth>("/api/integrations/adms/health");
+        // Hard cap so the pill cannot stick on "Checking…" if ADMS/gateway hangs.
+        const res = await apiWithTimeout<AdmsHealth>("/api/integrations/adms/health", 5000);
         if (cancelled) return;
 
         const when = formatLastOnlineIst(
@@ -82,28 +104,46 @@ export default function AdmsStatusBadge({ size = 32, className = "" }: Props) {
           res.last_online_ist || res.primary?.last_online_ist || null,
         );
 
-        // Green only when gateway up AND ≥1 device with recent heartbeat.
-        const isOnline = !!res.ok;
-        setOnline(isOnline);
+        const next = resolveTone(res);
+        setTone(next);
 
-        if (isOnline) {
+        if (next === "online") {
           const n = res.devices_online ?? 0;
           setLabel("Online");
           setHint(n > 1 ? `ADMS Online · ${n} devices` : "ADMS Online · device heartbeat OK");
           return;
         }
 
-        // Offline: always append last heartbeat time when we have it.
+        if (next === "unstable") {
+          setLabel(when ? `Unstable · ${when}` : "Unstable");
+          setHint(
+            res.recovery_hint ||
+              (when
+                ? `ADMS Unstable · last heartbeat ${when} IST (45–120s; not Offline yet)`
+                : "ADMS Unstable · waiting for next device poll"),
+          );
+          return;
+        }
+
         setLabel(offlineLabel(when));
         if (res.gateway_ok === false) {
           setHint(when ? `ADMS gateway unreachable · last online ${when} IST` : "ADMS Offline · gateway unreachable");
+        } else if (res.needs_onsite) {
+          setHint(
+            res.recovery_hint ||
+              (when
+                ? `ADMS Offline · device silent since ${when} IST — toggle Cloud/ADMS or power-cycle`
+                : "ADMS Offline · device silent — toggle Cloud/ADMS or power-cycle"),
+          );
         } else {
-          setHint(when ? `ADMS Offline · last heartbeat ${when} IST` : "ADMS Offline · no device heartbeat");
+          setHint(
+            res.recovery_hint ||
+              (when ? `ADMS Offline · last heartbeat ${when} IST` : "ADMS Offline · no device heartbeat"),
+          );
         }
       } catch {
         if (!cancelled) {
-          setOnline(false);
-          // Keep prior label if it already had a timestamp; otherwise plain Offline.
+          setTone("offline");
           setLabel((prev) => (prev.startsWith("Offline ·") ? prev : "Offline"));
           setHint("ADMS Offline");
         }
@@ -119,7 +159,8 @@ export default function AdmsStatusBadge({ size = 32, className = "" }: Props) {
     };
   }, []);
 
-  const tone = online === null ? "pending" : online ? "online" : "offline";
+  const pillClass =
+    tone === "online" ? "green" : tone === "unstable" ? "amber" : tone === "offline" ? "red" : "";
 
   return (
     <div className={`adms-status-badge ${tone} ${className}`.trim()} title={hint}>
@@ -131,7 +172,7 @@ export default function AdmsStatusBadge({ size = 32, className = "" }: Props) {
         className="adms-status-logo"
         draggable={false}
       />
-      <span className={`pill ${online ? "green" : online === false ? "red" : ""}`}>
+      <span className={`pill ${pillClass}`}>
         <span className="adms-status-dot" aria-hidden />
         <span className="adms-status-text">{label}</span>
       </span>
