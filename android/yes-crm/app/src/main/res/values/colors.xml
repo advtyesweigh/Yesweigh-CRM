@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="yes_navy">#102543</color>
+    <color name="yes_blue">#245CF5</color>
+    <color name="yes_blue_dark">#1B4AD1</color>
+    <color name="yes_blue_soft">#E9EFFF</color>
+    <color name="yes_orange">#FF6A25</color>
+    <color name="yes_bg">#F4F6FA</color>
+    <color name="yes_shell">#E9EDF5</color>
+    <color name="yes_white">#FFFFFF</color>
+    <color name="yes_ink">#132239</color>
+    <color name="yes_muted">#64748B</color>
+    <color name="yes_line">#E4EAF2</color>
+    <color name="yes_green">#09865E</color>
+    <color name="yes_green_soft">#E6F8F0</color>
+    <color name="yes_red">#CF4050</color>
+    <color name="yes_red_soft">#FFF0F1</color>
+    <color name="yes_amber">#AD6909</color>
+    <color name="yes_amber_soft">#FFF3E1</color>
+    <color name="yes_violet">#7752D7</color>
+    <color name="yes_violet_soft">#F1EBFF</color>
+    <color name="yes_wa">#149D67</color>
+    <color name="yes_wa_soft">#E5F8EF</color>
+    <color name="yes_hero_end">#173E83</color>
+    <color name="yes_status_bar">#102543</color>
+</resources>

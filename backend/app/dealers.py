@@ -17,7 +17,8 @@ from app.db import get_db
 from app.dealer_exclusions import dealer_not_excluded_clause
 from app.dealer_merges import remapped_customer_id_expr, sales_customer_ids_for_dealer
 from app.models import Dealer, User, ZohoDealer, ZohoSale
-from app.sales_amount import sales_amount_expr
+from app.sales_amount import sales_amount_expr, zoho_sale_countable_clause
+from app.state_normalize import canon_state, state_match_values
 
 router = APIRouter(prefix="/api/dealers", tags=["dealers"])
 
@@ -132,9 +133,44 @@ def _sales_by_customer_subq():
             func.max(ZohoSale.date).label("last_sale_date"),
         )
         .where(ZohoSale.customer_id != "")
+        .where(*zoho_sale_countable_clause())
         .group_by(cid)
         .subquery()
     )
+
+
+async def dealer_lifetime_sales_map(db: AsyncSession, dealers: list[Dealer]) -> dict[int, float]:
+    """Map dealer.id → lifetime tax-exclusive sales (Zoho-synced, merge-aware)."""
+    if not dealers:
+        return {}
+    zoho_ids: list[str] = []
+    seen: set[str] = set()
+    zoho_to_dealer: dict[str, int] = {}
+    for d in dealers:
+        zid = (d.zoho_contact_id or "").strip()
+        if not zid:
+            continue
+        zoho_to_dealer[zid] = d.id
+        if zid not in seen:
+            seen.add(zid)
+            zoho_ids.append(zid)
+    if not zoho_ids:
+        return {d.id: 0.0 for d in dealers}
+
+    sales_sub = _sales_by_customer_subq()
+    rows = (
+        await db.execute(
+            select(sales_sub.c.customer_id, sales_sub.c.sales_total).where(
+                sales_sub.c.customer_id.in_(zoho_ids)
+            )
+        )
+    ).all()
+    by_zoho = {str(cid): round(float(amt or 0), 2) for cid, amt in rows if cid}
+    out: dict[int, float] = {}
+    for d in dealers:
+        zid = (d.zoho_contact_id or "").strip()
+        out[d.id] = by_zoho.get(zid, 0.0) if zid else 0.0
+    return out
 
 
 def _visible_dealers_clause() -> Any:
@@ -171,7 +207,11 @@ def _apply_list_scope(
         )
     state_key = state.strip()
     if state_key:
-        stmt = stmt.where(Dealer.state == state_key)
+        state_vals = state_match_values(state_key)
+        if len(state_vals) == 1:
+            stmt = stmt.where(Dealer.state == state_vals[0])
+        else:
+            stmt = stmt.where(or_(*[Dealer.state == v for v in state_vals]))
     # UI labels district; DB only has city — accept either param.
     city_key = (city or district or "").strip()
     if city_key:
@@ -205,29 +245,6 @@ class SalesByStateOut(BaseModel):
     items: list[SalesByStateRow]
 
 
-_STATE_CANON: dict[str, str] = {
-    "orissa": "Odisha",
-    "odisha": "Odisha",
-    "uttaranchal": "Uttarakhand",
-    "uttarakhand": "Uttarakhand",
-    "pondicherry": "Puducherry",
-    "puducherry": "Puducherry",
-    "nct of delhi": "Delhi",
-    "delhi": "Delhi",
-    "jammu & kashmir": "Jammu and Kashmir",
-    "andaman & nicobar islands": "Andaman and Nicobar",
-    "andaman and nicobar islands": "Andaman and Nicobar",
-}
-
-
-def _canon_state(raw: str) -> str:
-    s = (raw or "").strip()
-    if not s:
-        return ""
-    key = " ".join(s.lower().replace("&", " and ").split())
-    return _STATE_CANON.get(key) or s
-
-
 @router.get("/sales-by-state", response_model=SalesByStateOut)
 async def sales_by_state(
     db: Db,
@@ -252,6 +269,7 @@ async def sales_by_state(
             .join(Dealer, Dealer.zoho_contact_id == remapped)
             .where(visible)
             .where(ZohoSale.customer_id != "")
+            .where(*zoho_sale_countable_clause())
             .where(ZohoSale.date >= y0)
             .where(ZohoSale.date < y1)
             .where(Dealer.state.is_not(None))
@@ -262,7 +280,7 @@ async def sales_by_state(
 
     merged: dict[str, tuple[float, int]] = {}
     for state_raw, sales_total, invoice_count in rows:
-        state = _canon_state(str(state_raw or ""))
+        state = canon_state(str(state_raw or ""))
         if not state:
             continue
         prev_sales, prev_n = merged.get(state, (0.0, 0))
@@ -291,7 +309,12 @@ async def list_dealer_states(db: Db, user: CurrentUser):
             .order_by(Dealer.state.asc())
         )
     ).scalars().all()
-    return [str(s).strip() for s in rows if str(s or "").strip()]
+    merged: set[str] = set()
+    for s in rows:
+        label = canon_state(str(s or ""))
+        if label:
+            merged.add(label)
+    return sorted(merged)
 
 
 @router.get("/cities", response_model=list[str])
@@ -305,12 +328,13 @@ async def list_dealer_cities(
     state_key = state.strip()
     if not state_key:
         return []
+    state_vals = state_match_values(state_key)
     visible = _visible_dealers_clause()
     rows = (
         await db.execute(
             select(func.distinct(Dealer.city))
             .where(visible)
-            .where(Dealer.state == state_key)
+            .where(or_(*[Dealer.state == v for v in state_vals]))
             .where(Dealer.city.is_not(None))
             .where(Dealer.city != "")
             .order_by(Dealer.city.asc())
@@ -453,6 +477,7 @@ async def list_dealers(
                     func.max(ZohoSale.date),
                 )
                 .where(ZohoSale.customer_id.in_(zoho_ids))
+                .where(*zoho_sale_countable_clause())
                 .group_by(remapped)
             )
         ).all()

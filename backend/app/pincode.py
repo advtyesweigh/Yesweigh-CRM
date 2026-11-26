@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from app.auth import get_current_user
 from app.models import User
+from app.state_normalize import canon_state
 
 router = APIRouter(tags=["pincode"])
 
@@ -87,7 +88,7 @@ async def lookup_pincode(pin: str) -> PincodeOut:
         or str(office.get("Name") or "").strip()
     )
     district = str(office.get("District") or "").strip()
-    state = str(office.get("State") or "").strip()
+    state = canon_state(str(office.get("State") or "").strip())
     name = str(office.get("Name") or "").strip()
 
     data = {

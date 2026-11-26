@@ -1,44 +1,78 @@
 import { Navigate, NavLink, Route, Routes, useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { useEffect, useState } from "react";
-import { api, clearToken, getToken, login, setToken } from "./api/client";
+import { api, clearToken, getToken, login, logout, setToken } from "./api/client";
 import Dashboard from "./pages/Dashboard";
 import Leads from "./pages/Leads";
 import Work from "./pages/Work";
 import WhatsApp from "./pages/WhatsApp";
+import WhatsAppReplyStats from "./pages/WhatsAppReplyStats";
 import Settings, { SETTINGS_TABS, parseSettingsTab, type SettingsTabId } from "./pages/Settings";
 import EmployeeProfile from "./pages/EmployeeProfile";
 import Placeholder from "./pages/Placeholder";
+import Calling from "./pages/Calling";
 import Dealers from "./pages/Dealers";
 import Products from "./pages/Products";
 import Analytics from "./pages/Analytics";
+import Campaigns from "./pages/Campaigns";
+import Audience from "./pages/Audience";
+import DealerFinder from "./pages/DealerFinder";
+import Intelligence from "./pages/Intelligence";
 import { NAV_ICONS, type NavIconId } from "./navIcons";
+import { homePathForRole, isCampaignsOnlyRole, spaPathAllowedForRole } from "./permissions";
 
 const NAV: { group: string; items: { to: string; label: string; icon: NavIconId }[] }[] = [
   {
-    group: "",
+    group: "Overview",
     items: [
       { to: "/", label: "Dashboard", icon: "home" },
       { to: "/analytics", label: "Analytics", icon: "chart" },
-      { to: "/whatsapp", label: "WhatsApp Inbox", icon: "whatsapp" },
-      { to: "/calling", label: "Call List", icon: "phone" },
       { to: "/work", label: "AI Agent", icon: "checklist" },
-      { to: "/leads", label: "Leads", icon: "users" },
-      { to: "/dealers", label: "Dealer", icon: "store" },
-      { to: "/orders", label: "Quotations", icon: "file" },
+    ],
+  },
+  {
+    group: "Conversations",
+    items: [
+      { to: "/whatsapp", label: "WhatsApp Inbox", icon: "whatsapp" },
+      { to: "/intelligence", label: "Intelligence", icon: "intel" },
+      { to: "/calling", label: "Call List", icon: "phone" },
       { to: "/campaigns", label: "Campaigns", icon: "megaphone" },
       { to: "/meta", label: "Meta Ads", icon: "target" },
-      { to: "/assets", label: "Marketing Assets", icon: "image" },
-      { to: "/products", label: "Products", icon: "package" },
-      { to: "/performance", label: "Performance", icon: "trending" },
-      { to: "/reports", label: "Reports", icon: "bars" },
-      { to: "/settings", label: "Settings", icon: "gear" },
     ],
+  },
+  {
+    group: "Growth",
+    items: [
+      { to: "/leads", label: "Leads", icon: "users" },
+      { to: "/dealers", label: "Dealer", icon: "store" },
+      { to: "/assets", label: "Audience", icon: "image" },
+      { to: "/products", label: "Products", icon: "package" },
+      { to: "/orders", label: "Quotations", icon: "file" },
+    ],
+  },
+  {
+    group: "Admin",
+    items: [{ to: "/settings", label: "Settings", icon: "gear" }],
   },
 ];
 
-const TITLES: Record<string, string> = Object.fromEntries(
-  NAV.flatMap((g) => g.items.map((i) => [i.to === "/" ? "/" : i.to, i.label]))
-);
+const PLACEHOLDER_TITLES: Record<string, string> = {
+  "/orders": "Quotations",
+  "/meta": "Meta Ads",
+  "/performance": "Performance",
+  "/reports": "Reports",
+  "/customers": "Customers",
+  "/calendar": "Calendar",
+};
+
+const TITLES: Record<string, string> = {
+  ...Object.fromEntries(NAV.flatMap((g) => g.items.map((i) => [i.to === "/" ? "/" : i.to, i.label]))),
+  ...PLACEHOLDER_TITLES,
+};
+
+function navForRole(role: string | undefined) {
+  if (!isCampaignsOnlyRole(role)) return NAV;
+  return [{ group: "", items: [{ to: "/campaigns", label: "Campaigns", icon: "megaphone" as NavIconId }] }];
+}
 
 function Login() {
   const nav = useNavigate();
@@ -52,9 +86,10 @@ function Login() {
     try {
       const data = await login(email, password);
       setToken(data.access_token);
-      nav("/");
-    } catch {
-      setErr("Invalid login");
+      nav(homePathForRole(data.role));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message.trim() : "";
+      setErr(msg || "Invalid login");
     }
   }
   return (
@@ -155,7 +190,21 @@ function Shell({ children }: { children: React.ReactNode }) {
     }
   }, [sidebarOpen]);
 
-  const isInbox = loc.pathname === "/whatsapp";
+  useEffect(() => {
+    const openNav = () => setSidebarOpen(true);
+    window.addEventListener("crm:sidebar-open", openNav);
+    return () => window.removeEventListener("crm:sidebar-open", openNav);
+  }, []);
+
+  useEffect(() => {
+    if (!me?.role) return;
+    if (!spaPathAllowedForRole(loc.pathname, me.role)) {
+      nav("/campaigns", { replace: true });
+    }
+  }, [me?.role, loc.pathname, nav]);
+
+  const isInbox = loc.pathname === "/whatsapp" || loc.pathname === "/whatsapp/reply-stats";
+  const isIntel = loc.pathname === "/intelligence";
   const isAiAgent = loc.pathname === "/work" || loc.pathname === "/ai";
   const isSettings = loc.pathname === "/settings";
   const settingsTab = parseSettingsTab(params.get("tab"));
@@ -163,6 +212,7 @@ function Shell({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (isAiAgent) document.title = "AI Agent · YesWeigh CRM";
     else if (isSettings) document.title = "Settings · YesWeigh CRM";
+    else if (loc.pathname === "/whatsapp/reply-stats") document.title = "Reply stats · YesWeigh CRM";
     else if (isInbox) document.title = "WhatsApp Inbox · YesWeigh CRM";
     else {
       const title = TITLES[loc.pathname === "/" ? "/" : loc.pathname];
@@ -177,8 +227,8 @@ function Shell({ children }: { children: React.ReactNode }) {
     setParams(next, { replace: true });
   }
 
-  function logout() {
-    clearToken();
+  async function onLogout() {
+    await logout();
     nav("/login");
   }
 
@@ -187,7 +237,9 @@ function Shell({ children }: { children: React.ReactNode }) {
   }
 
   return (
-    <div className={`app ${sidebarOpen ? "" : "nav-collapsed"} ${isInbox ? "inbox-mode" : ""} ${isAiAgent ? "ai-mode" : ""} ${isSettings ? "settings-mode" : ""}`.trim()}>
+    <div
+      className={`app ${sidebarOpen ? "" : "nav-collapsed"} ${isInbox ? "inbox-mode" : ""} ${isIntel ? "intel-mode" : ""} ${isAiAgent ? "ai-mode" : ""} ${isSettings ? "settings-mode" : ""}`.trim()}
+    >
       {!sidebarOpen && (
         <button
           type="button"
@@ -222,7 +274,7 @@ function Shell({ children }: { children: React.ReactNode }) {
           </button>
         </div>
         <nav className="nav">
-          {NAV.map((g) => (
+          {navForRole(me?.role).map((g) => (
             <div key={g.group || "main"}>
               {g.group ? <div className="navgroup">{g.group.toUpperCase()}</div> : null}
               {g.items.map((item) => (
@@ -240,7 +292,7 @@ function Shell({ children }: { children: React.ReactNode }) {
             <span>{me?.name || "Signed in"}</span>
             <span className="sidefoot-ver">v0.1</span>
           </div>
-          <button type="button" className="btn side-logout" onClick={logout} tabIndex={sidebarOpen ? undefined : -1}>Logout</button>
+          <button type="button" className="btn side-logout" onClick={() => void onLogout()} tabIndex={sidebarOpen ? undefined : -1}>Logout</button>
         </div>
       </aside>
       <main className="main">
@@ -262,7 +314,11 @@ function Shell({ children }: { children: React.ReactNode }) {
             </div>
           </header>
         )}
-        <div className={`content ${isInbox ? "content-inbox" : ""} ${isAiAgent ? "content-ai" : ""}`.trim()}>{children}</div>
+        <div
+          className={`content ${isInbox ? "content-inbox" : ""} ${isIntel ? "content-intel" : ""} ${isAiAgent ? "content-ai" : ""}`.trim()}
+        >
+          {children}
+        </div>
       </main>
     </div>
   );
@@ -279,17 +335,24 @@ export default function App() {
       <Route path="/login" element={<Login />} />
       <Route path="/" element={<Private><Dashboard /></Private>} />
       <Route path="/analytics" element={<Private><Analytics /></Private>} />
+      <Route path="/intelligence" element={<Private><Intelligence /></Private>} />
       <Route path="/leads" element={<Private><Leads /></Private>} />
       <Route path="/work" element={<Private><Work /></Private>} />
       <Route path="/ai" element={<Navigate to="/work" replace />} />
       <Route path="/whatsapp" element={<Private><WhatsApp /></Private>} />
+      <Route path="/whatsapp/reply-stats" element={<Private><WhatsAppReplyStats /></Private>} />
       <Route path="/employees" element={<Navigate to="/settings?tab=employees" replace />} />
       <Route path="/employees/:id" element={<Private><EmployeeProfile /></Private>} />
       <Route path="/settings" element={<Private><Settings /></Private>} />
+      <Route path="/dealer-finder" element={<Private><DealerFinder /></Private>} />
       <Route path="/dealers" element={<Private><Dealers /></Private>} />
       <Route path="/products" element={<Private><Products /></Private>} />
+      <Route path="/campaigns" element={<Private><Campaigns /></Private>} />
+      <Route path="/assets" element={<Private><Audience /></Private>} />
+      <Route path="/audience" element={<Navigate to="/assets" replace />} />
+      <Route path="/calling" element={<Private><Calling /></Private>} />
       {[
-        "/customers", "/calling", "/orders", "/campaigns", "/meta", "/assets",
+        "/customers", "/orders", "/meta",
         "/calendar", "/performance", "/reports",
       ].map((p) => (
         <Route key={p} path={p} element={<Private><Placeholder title={TITLES[p] || p} /></Private>} />

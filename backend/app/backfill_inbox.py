@@ -34,11 +34,26 @@ async def main() -> None:
             except json.JSONDecodeError:
                 continue
             try:
-                await _ingest_webhook_message(db, inst, payload, ev.event_type)
+                _intel_id, ai_jobs = await _ingest_webhook_message(
+                    db, inst, payload, ev.event_type
+                )
                 ok += 1
+                # Commit per event so post-commit STT/translate can see the row.
+                await db.commit()
+                if ai_jobs:
+                    from app.sarvam_transcribe import (
+                        schedule_text_translation,
+                        schedule_transcription,
+                    )
+
+                    for kind, mid in ai_jobs:
+                        if kind == "stt":
+                            schedule_transcription(int(mid))
+                        elif kind == "translate":
+                            schedule_text_translation(int(mid))
             except Exception as exc:  # noqa: BLE001
                 print(f"event {ev.id} failed: {exc}")
-        await db.commit()
+                await db.rollback()
         print(f"Done. processed={ok}")
     await engine.dispose()
 

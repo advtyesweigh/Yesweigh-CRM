@@ -57,6 +57,22 @@ type UsagePayload = {
   recent?: UsageRow[];
 };
 
+type AiSettingsPayload = {
+  configured: boolean;
+  status: string;
+  status_label: string;
+  provider: string;
+  model: string;
+  monthly_budget_inr: number;
+  daily_budget_inr: number;
+  usage: UsagePayload;
+  google_places?: {
+    configured: boolean;
+    status_label: string;
+    env_hint?: string;
+  };
+};
+
 type Period = "month" | "today";
 type FeatureFilter = "all" | "whatsapp" | "agent";
 type StatusFilter = "all" | "ok" | "fail";
@@ -262,6 +278,9 @@ function purposeMeta(purpose: string): { label: string; icon: ReactNode; source:
   if (p === "knowledge_search") {
     return { label: "Knowledge Search", icon: <BookIcon size={14} />, source: "whatsapp" };
   }
+  if (p === "knowledge_learning") {
+    return { label: "KB Learning", icon: <BookIcon size={14} />, source: "whatsapp" };
+  }
   if (p === "command" || p === "agent" || p.startsWith("agent")) {
     return { label: "AI Agent", icon: <SparklesIcon size={14} />, source: "agent" };
   }
@@ -278,6 +297,7 @@ function rowSource(r: UsageRow): FeatureFilter {
 
 export default function GeminiSettings() {
   const [data, setData] = useState<UsagePayload | null>(null);
+  const [aiSettings, setAiSettings] = useState<AiSettingsPayload | null>(null);
   const [err, setErr] = useState("");
   const [loading, setLoading] = useState(true);
   const [period, setPeriod] = useState<Period>("month");
@@ -287,8 +307,12 @@ export default function GeminiSettings() {
 
   const load = useCallback(async () => {
     setErr("");
-    const res = await api<UsagePayload>("/api/ai/usage?recent_limit=200");
+    const [res, settings] = await Promise.all([
+      api<UsagePayload>("/api/ai/usage?recent_limit=200"),
+      api<AiSettingsPayload>("/api/ai/settings"),
+    ]);
     setData(res);
+    setAiSettings(settings);
   }, []);
 
   useEffect(() => {
@@ -361,10 +385,71 @@ export default function GeminiSettings() {
       .finally(() => setLoading(false));
   };
 
+  const dashUsage = aiSettings?.usage || data;
+  const configured = aiSettings ? Boolean(aiSettings.configured) : null;
+
   return (
     <div className="gemini-settings">
       {err ? <p className="err" style={{ marginBottom: 12 }}>{err}</p> : null}
       {loading && !data ? <p style={{ color: "var(--muted)", marginBottom: 12 }}>Loading…</p> : null}
+
+      <section className="panel gemini-agent-dash">
+        <div className="gemini-agent-dash-head">
+          <h2>AI Agent</h2>
+          <p>Usage, model, and budget for Gemini commands.</p>
+        </div>
+        <div className="ai-kpis">
+          <div className="ai-kpi">
+            <div className="ai-kpi-label">Status</div>
+            <div className="ai-kpi-value">{aiSettings?.status_label || "—"}</div>
+            <div className="ai-kpi-sub">
+              {configured == null
+                ? "Checking key…"
+                : configured
+                  ? "Gemini key present"
+                  : "GEMINI_API_KEY missing"}
+            </div>
+          </div>
+          <div className="ai-kpi">
+            <div className="ai-kpi-label">Model</div>
+            <div className="ai-kpi-value ai-kpi-model">{aiSettings?.model || "—"}</div>
+            <div className="ai-kpi-sub">{aiSettings?.provider || "gemini"}</div>
+          </div>
+          <div className="ai-kpi">
+            <div className="ai-kpi-label">Spent this month</div>
+            <div className="ai-kpi-value">{inr(dashUsage?.spent_month_inr || 0)}</div>
+            <div className="ai-kpi-sub">Budget {inr(dashUsage?.monthly_budget_inr || 0, 0)}</div>
+          </div>
+          <div className="ai-kpi">
+            <div className="ai-kpi-label">Remaining</div>
+            <div className="ai-kpi-value">{inr(dashUsage?.remaining_monthly_inr || 0)}</div>
+            <div className="ai-kpi-sub">
+              Today {inr(dashUsage?.spent_today_inr || 0)} / {inr(dashUsage?.daily_budget_inr || 0, 0)}
+            </div>
+          </div>
+          <div className="ai-kpi">
+            <div className="ai-kpi-label">Requests</div>
+            <div className="ai-kpi-value">{dashUsage?.requests_month ?? "—"}</div>
+            <div className="ai-kpi-sub">{dashUsage?.requests_today ?? 0} today</div>
+          </div>
+          <div className="ai-kpi">
+            <div className="ai-kpi-label">Google Places</div>
+            <div className="ai-kpi-value">
+              {aiSettings?.google_places?.status_label || "—"}
+            </div>
+            <div className="ai-kpi-sub">
+              {aiSettings?.google_places?.configured
+                ? "Dealer discovery tools ready"
+                : "Set GOOGLE_MAPS_API_KEY on server"}
+            </div>
+          </div>
+          <div className="ai-kpi">
+            <div className="ai-kpi-label">Automations</div>
+            <div className="ai-kpi-value">0</div>
+            <div className="ai-kpi-sub">Phase 2 worker</div>
+          </div>
+        </div>
+      </section>
 
       {overview ? (
         <section className="panel gemini-overview">

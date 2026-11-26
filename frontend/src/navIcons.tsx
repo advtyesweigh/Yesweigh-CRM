@@ -29,6 +29,7 @@ export type NavIconId =
   | "trending"
   | "bars"
   | "chart"
+  | "intel"
   | "gear";
 
 export const NAV_ICONS: Record<NavIconId, ReactNode> = {
@@ -144,6 +145,19 @@ export const NAV_ICONS: Record<NavIconId, ReactNode> = {
       <path d="M7 14v4" />
       <path d="M12 10v8" />
       <path d="M17 6v12" />
+    </svg>
+  ),
+  intel: (
+    <svg {...stroke}>
+      <circle cx="12" cy="12" r="2" />
+      <path d="M12 3v3" />
+      <path d="M12 18v3" />
+      <path d="M3 12h3" />
+      <path d="M18 12h3" />
+      <path d="m5.6 5.6 2.1 2.1" />
+      <path d="m16.3 16.3 2.1 2.1" />
+      <path d="m5.6 18.4 2.1-2.1" />
+      <path d="m16.3 7.7 2.1-2.1" />
     </svg>
   ),
   gear: (

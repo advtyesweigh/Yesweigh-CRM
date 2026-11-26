@@ -33,6 +33,13 @@ def newsletter_list_filter():
     return ~WhatsAppConversation.customer_jid.ilike("%@newsletter")
 
 
+def dm_inbox_filter():
+    """1:1 chats only — exclude @g.us groups from DM-only inbox metrics."""
+    from app.models import WhatsAppConversation
+
+    return ~WhatsAppConversation.customer_jid.ilike("%@g.us")
+
+
 def parse_group_name(payload: Any) -> str:
     """Best-effort group subject from Evolution /group/info or /group/list row."""
     if not isinstance(payload, dict):

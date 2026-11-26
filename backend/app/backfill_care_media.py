@@ -86,7 +86,7 @@ async def main() -> None:
                 msg.body = MEDIA_LABELS.get(msg.media_type or "", "Attachment")
             ok += 1
             print(f"saved id={msg.id} type={msg.media_type} -> {msg.media_url}")
-            if (msg.media_type or "").lower() in {"audio", "ptt", "voice"} and msg.media_url:
+            if (msg.media_type or "").lower() in {"audio", "ptt", "voice", "video"} and msg.media_url:
                 try:
                     from app.sarvam_transcribe import schedule_transcription
 

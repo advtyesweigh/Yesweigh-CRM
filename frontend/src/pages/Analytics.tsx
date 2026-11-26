@@ -139,6 +139,7 @@ const REGION_OF: Record<string, string> = {
   "Madhya Pradesh": "West",
   "Dadra and Nagar Haveli and Daman and Diu": "West",
   Kerala: "South",
+  Keralam: "South",
   Karnataka: "South",
   "Tamil Nadu": "South",
   Telangana: "South",

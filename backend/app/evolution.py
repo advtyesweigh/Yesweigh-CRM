@@ -1070,13 +1070,17 @@ async def evolution_webhook(
 
     # Persist inbound / outbound chat messages into the CRM inbox
     # Skip PushName-only noise; Message / SendMessage carry the body.
+    intel_conv_id: int | None = None
+    post_commit_ai: list[tuple[str, int]] = []
     if event_type in {"Message", "SendMessage"} or (
         any(x in lower for x in ("message", "messages", "send_message", "receive"))
         and "receipt" not in lower
         and "pushname" not in lower
     ):
         try:
-            await _ingest_webhook_message(db, inst, payload, event_type)
+            intel_conv_id, post_commit_ai = await _ingest_webhook_message(
+                db, inst, payload, event_type
+            )
         except Exception as exc:  # noqa: BLE001
             print(f"webhook ingest error: {exc}")
 
@@ -1088,6 +1092,34 @@ async def evolution_webhook(
             pass
 
     await db.commit()
+    # Schedule STT/translate only AFTER commit — otherwise the background task
+    # often hits not-found and leaves voice bubbles with an empty Transcribe link.
+    if post_commit_ai:
+        try:
+            from app.sarvam_transcribe import schedule_text_translation, schedule_transcription
+
+            for kind, mid in post_commit_ai:
+                if kind == "stt":
+                    schedule_transcription(int(mid))
+                elif kind == "translate":
+                    schedule_text_translation(int(mid))
+        except Exception as exc:  # noqa: BLE001
+            print(f"post-commit AI schedule skipped: {exc}")
+    if intel_conv_id:
+        try:
+            from app.intel.jobs import schedule_thread_intel
+
+            schedule_thread_intel(int(intel_conv_id))
+        except Exception as exc:  # noqa: BLE001
+            print(f"intel enqueue skipped: {exc}")
+    try:
+        from app.whatsapp_new_messenger import schedule_new_messenger
+
+        for kind, mid in post_commit_ai:
+            if kind == "new_messenger":
+                schedule_new_messenger(message_id=int(mid))
+    except Exception as exc:  # noqa: BLE001
+        print(f"new_messenger schedule skipped: {exc}")
     if became_connected:
         _maybe_schedule_history_sync(inst, trigger="webhook_logged_in")
     return {"ok": True}
@@ -2118,12 +2150,17 @@ def _parse_wa_timestamp(raw: Any) -> datetime | None:
 
 async def _ingest_webhook_message(
     db: AsyncSession, inst: WhatsAppInstance, payload: dict[str, Any], event_type: str
-) -> None:
+) -> tuple[int | None, list[tuple[str, int]]]:
+    """Ingest one Evolution message. Returns ``(intel_conv_id, post_commit_ai_jobs)``.
+
+    AI jobs are ``("stt"|"translate", message_id)`` and MUST be scheduled only after
+    the webhook handler commits — otherwise fire-and-forget STT often sees not-found.
+    """
     fields = _extract_message_fields(payload)
     if not fields:
-        return
+        return None, []
     if is_inbox_excluded_jid(fields.get("jid") or ""):
-        return
+        return None, []
     is_group = bool(fields.get("is_group")) or is_group_jid(fields.get("jid") or "")
     # Participant LID must never drive group conversation matching / merge.
     lid_digits = (
@@ -2131,6 +2168,28 @@ async def _ingest_webhook_message(
         if is_group
         else (_digits(fields.get("lid") or "") or _jid_lid(fields.get("jid") or ""))
     )
+    async def _absorb_outbound_echo(exists: WhatsAppMessage) -> None:
+        # Upgrade tick if this is our outbound echo — never insert a WhatsApp twin.
+        if fields["from_me"] and exists.direction == "out" and exists.status in {
+            "sending",
+            "sent",
+            "delivered",
+        }:
+            if exists.status in {"sending", "sent"}:
+                exists.status = "delivered"
+        if fields["external_id"] and not (exists.external_message_id or "").strip():
+            exists.external_message_id = fields["external_id"]
+        # Keep CRM agent name; webhook would otherwise relabel as "WhatsApp".
+        if fields["from_me"] and (exists.sender_name or "").strip() in {"", "WhatsApp"}:
+            # Prefer leaving employee name if already set; only fill blank.
+            if not (exists.sender_name or "").strip():
+                exists.sender_name = "WhatsApp"
+        # Learn LID on the conversation that already owns this message (CRM send path).
+        # Skip for groups — participant LID is not the chat identity.
+        owned = await db.get(WhatsAppConversation, exists.conversation_id)
+        if owned and lid_digits and not is_group_jid(owned.customer_jid or ""):
+            _remember_lid(owned, lid_digits)
+
     if fields["external_id"]:
         exists = (
             await db.execute(
@@ -2146,18 +2205,8 @@ async def _ingest_webhook_message(
             )
         ).scalar_one_or_none()
         if exists:
-            # Upgrade tick if this is our outbound echo
-            if fields["from_me"] and exists.direction == "out" and exists.status in {"sending", "sent", "delivered"}:
-                if exists.status in {"sending", "sent"}:
-                    exists.status = "delivered"
-            if not (exists.external_message_id or "").strip():
-                exists.external_message_id = fields["external_id"]
-            # Learn LID on the conversation that already owns this message (CRM send path).
-            # Skip for groups — participant LID is not the chat identity.
-            owned = await db.get(WhatsAppConversation, exists.conversation_id)
-            if owned and lid_digits and not is_group_jid(owned.customer_jid or ""):
-                _remember_lid(owned, lid_digits)
-            return
+            await _absorb_outbound_echo(exists)
+            return None, []
 
     # Groups: match only by @g.us jid / group id. DMs: PN + LID peer matching.
     peers = await _find_conversations_for_peer(
@@ -2215,6 +2264,25 @@ async def _ingest_webhook_message(
     preview_text = display_text
     if is_group and not fields["from_me"] and (fields.get("push_name") or "").strip():
         preview_text = f"{fields['push_name'].strip()}: {display_text}"
+
+    # Early echo merge when we already have a conversation (CRM send path).
+    # Avoids media download + inserting a WhatsApp-labeled twin of the agent row.
+    if fields["from_me"] and conv and (display_text or "").strip():
+        try:
+            from app.ai.whatsapp_send_guards import find_recent_outbound_echo_twin
+
+            twin = await find_recent_outbound_echo_twin(
+                db,
+                instance_id=inst.id,
+                conversation_id=conv.id,
+                body=display_text,
+                within_seconds=900,
+            )
+            if twin is not None:
+                await _absorb_outbound_echo(twin)
+                return None, []
+        except Exception as exc:  # noqa: BLE001
+            print(f"outbound echo dedupe skipped: {exc}")
 
     if not conv:
         conv = WhatsAppConversation(
@@ -2285,14 +2353,14 @@ async def _ingest_webhook_message(
             conv.last_message_preview = preview_text[:255]
             conv.last_message_at = event_at
             if fields["from_me"]:
-                # Reply from the physical phone (or linked device) → clear CRM unread/New
-                clear_conversation_unread(conv)
+                # Awaiting/unread cleared when the outbound row is persisted (below).
                 if conv.status in {"Pending Customer Reply", "Resolved"}:
                     conv.status = "Open"
             else:
                 # History backfill of old inbound should not inflate unread
                 if event_at >= now - timedelta(minutes=5):
-                    conv.unread_count = (conv.unread_count or 0) + 1
+                    if not getattr(conv, "is_spam", False):
+                        conv.unread_count = (conv.unread_count or 0) + 1
                     if conv.status == "Resolved":
                         conv.status = "Open"
                         conv.tag = "Reopened"
@@ -2352,10 +2420,34 @@ async def _ingest_webhook_message(
     if body_text.strip().lower() in {"[media]", "media"}:
         body_text = "Attachment"
 
+    # Second-chance echo merge after media caption normalization (new conv / media outs).
+    if fields["from_me"] and conv and (body_text or "").strip():
+        try:
+            from app.ai.whatsapp_send_guards import find_recent_outbound_echo_twin
+
+            twin = await find_recent_outbound_echo_twin(
+                db,
+                instance_id=inst.id,
+                conversation_id=conv.id,
+                body=body_text,
+                within_seconds=900,
+            )
+            if twin is not None:
+                await _absorb_outbound_echo(twin)
+                return None, []
+        except Exception as exc:  # noqa: BLE001
+            print(f"outbound echo dedupe skipped: {exc}")
+
     sender_label = "WhatsApp" if fields["from_me"] else (
         fields["push_name"]
         or fields.get("participant_phone")
         or fields["phone"]
+    )
+    post_commit_ai: list[tuple[str, int]] = []
+    media_type_norm = (media_meta.get("media_type") or fields.get("media_type") or "").lower()
+    media_url_norm = media_meta.get("media_url") or ""
+    pending_stt = media_type_norm in {"audio", "ptt", "voice", "video"} and media_url_norm.startswith(
+        "/api/whatsapp/media/"
     )
     msg = WhatsAppMessage(
         public_id=str(uuid.uuid4()),
@@ -2364,27 +2456,52 @@ async def _ingest_webhook_message(
         whatsapp_instance_id=inst.id,
         direction="out" if fields["from_me"] else "in",
         body=body_text,
-        media_url=media_meta.get("media_url") or "",
+        media_url=media_url_norm,
         media_type=media_meta.get("media_type") or fields.get("media_type") or "",
         media_name=media_meta.get("media_name") or "",
         external_message_id=fields["external_id"],
         status="sent" if fields["from_me"] else "delivered",
         sender_name=sender_label,
         created_at=event_at,
+        # Visible "Transcribing…" until post-commit worker finishes (or fails).
+        transcription_status="pending" if pending_stt else "",
     )
     db.add(msg)
     await db.flush()
 
-    # Sarvam STT after media is on disk (inbound + outbound voice). Non-blocking.
-    if (msg.media_type or "").lower() in {"audio", "ptt", "voice"} and (msg.media_url or "").startswith(
-        "/api/whatsapp/media/"
-    ):
-        try:
-            from app.sarvam_transcribe import schedule_transcription
+    if not is_group:
+        if msg.direction == "in":
+            from app.whatsapp_reply_needed import apply_inbound_reply_state
 
-            schedule_transcription(msg.id)
+            await apply_inbound_reply_state(db, conv, inbound_text=body_text, inbound_msg=msg)
+        else:
+            from app.whatsapp_reply_latency import complete_staff_reply
+
+            await complete_staff_reply(
+                db,
+                conv,
+                replied_at=event_at,
+                source="phone_sync",
+                inst=inst,
+                msg=msg,
+            )
+
+    # Queue Sarvam work for AFTER webhook commit (see handler). Never schedule here.
+    if pending_stt:
+        post_commit_ai.append(("stt", int(msg.id)))
+    else:
+        try:
+            from app.sarvam_transcribe import is_text_translatable_message
+
+            if is_text_translatable_message(msg):
+                msg.transcription_status = "pending"
+                post_commit_ai.append(("translate", int(msg.id)))
         except Exception as exc:  # noqa: BLE001
-            print(f"transcription schedule skipped: {exc}")
+            print(f"text translation queue skipped: {exc}")
+
+    # New-messenger onboarding — inbound DMs only; runs after commit.
+    if not is_group and msg.direction == "in" and not fields.get("from_me"):
+        post_commit_ai.append(("new_messenger", int(msg.id)))
 
     # Live notify agents (WhatsApp-style)
     try:
@@ -2407,3 +2524,9 @@ async def _ingest_webhook_message(
         )
     except Exception:  # noqa: BLE001
         pass
+    from app.intel.extract import conversation_is_intel_subject
+
+    jid = conv.customer_jid or fields.get("jid") or ""
+    if is_group or not conversation_is_intel_subject(jid):
+        return None, post_commit_ai
+    return int(conv.id), post_commit_ai

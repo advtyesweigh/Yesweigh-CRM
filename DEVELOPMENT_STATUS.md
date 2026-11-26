@@ -1,9 +1,10 @@
 # YesWeigh CRM — Development Status
 
-Last updated: 2026-11-13
+Last updated: 2026-11-23
 
 ## Completed
 
+- [x] **All-India Dealer Discovery (foundation)** — excluded-state gates, `DealerAllIndiaRun` orchestration, pilot + gated full-country API, dashboard tab, India SKU cost preflight, admin spend / all-India enable gates
 - [x] VPS inspection (Caddy, Postgres, Docker, ports, resources)
 - [x] Postgres DB `yesweigh_crm` + role `crm` on Evolution Postgres host
 - [x] Caddy host `crm.yesweigh.in` (HTTPS)
@@ -24,6 +25,13 @@ Last updated: 2026-11-13
 - [ ] Redis container (internal) for future BullMQ
 - [ ] Replace transitional FastAPI stack without breaking DNS/Caddy
 - [ ] Employees: live ADMS present/absent punch sync, full permission matrix UI, salary encryption at rest
+
+## All-India dealer discovery — remaining
+
+- [ ] District/city drill-down filters on dashboard tiles (state-level only today)
+- [ ] AI chat tools wired to all-India orchestration (UI/API only)
+- [ ] Automated pytest in CI for `test_all_india_dealer_finder.py`
+- [ ] Per-state cost audit export before enqueueing next state in full run
 
 ## Pending (later phases)
 

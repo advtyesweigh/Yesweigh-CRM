@@ -22,6 +22,7 @@ from app.db import SessionLocal
 from app.dealer_exclusions import is_excluded_contact
 from app.models import Dealer, ZohoCreditNote, ZohoDealer, ZohoSale
 from app.phone_util import normalize_in_mobile
+from app.state_normalize import canon_state
 from app.zoho_service import _dec, upsert_credit_note, upsert_sale
 
 
@@ -310,7 +311,7 @@ async def import_contacts(db, files: list[Path]) -> dict[str, int]:
             if fields["billing_city"]:
                 staging.billing_city = fields["billing_city"]
             if fields["billing_state"]:
-                staging.billing_state = fields["billing_state"]
+                staging.billing_state = canon_state(fields["billing_state"])[:80]
             staging.status = fields["status"] or staging.status or "active"
             # Prefer backup raw if existing has no address object
             existing_raw = staging.raw_json or ""
@@ -361,7 +362,7 @@ async def import_contacts(db, files: list[Path]) -> dict[str, int]:
                 dealer.city = fields["billing_city"]
                 stats["cities_filled"] += 1
             if fields["billing_state"] and not (dealer.state or "").strip():
-                dealer.state = fields["billing_state"]
+                dealer.state = canon_state(fields["billing_state"])[:80]
             dealer.zoho_contact_id = cid
             dealer.status = (
                 "inactive"

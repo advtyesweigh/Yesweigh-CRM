@@ -101,9 +101,17 @@ Overview · Sales · Marketing · Operations · People · Administration
 
 - Keep `/opt/adms`, `/opt/mailcow-dockerized`, `/opt/evolution-go`, host Caddy.
 - CRM deploy path: `/opt/yesweigh-crm`
-- Caddy site `crm.yesweigh.in` → CRM web (reverse proxy).
+- Caddy `crm.yesweigh.in`: `/api/*` → `127.0.0.1:8100` (API direct); other paths → `127.0.0.1:8101` (nginx SPA). Keeps sends/webhooks alive during web-only deploy blips. Snippet: `deployment/vps-caddy-crm.snippet`.
 - Port plan: web `127.0.0.1:8101`, api `127.0.0.1:8100`, redis internal only.
+- CRM deploy uses flock (`/var/lock/yesweigh-crm-deploy.lock` on VPS; local tmp lock) — do not run overlapping `deploy_crm_ai.sh`.
 
 ## Legacy MVP
 
 An early FastAPI + React MVP existed under `backend/` + `frontend/`. Phase 1 NestJS monorepo **supersedes** that stack for production architecture; migrate carefully without downtime where possible.
+
+## All-India Dealer Discovery (2026-11)
+
+- Extends **Dealer Finder** (`backend/app/dealer_finder/`) — Gemini district→city plans, Places New staged search, SQL history cooldown, lead import.
+- **Excluded states (all-India only):** Tamil Nadu, Kerala/Keralam, Puducherry — omitted from full-India queue; manual / AI single-state jobs still allowed.
+- **Rollout:** pilot one district (default Rajasthan · Jaipur) → verify → admin `all_india_enabled` → sequential full-India run (one state at a time). **Never** auto-start on deploy.
+- UI: `/dealer-finder` → **All India** tab (tiles + pilot controls). Docs: `docs/ALL_INDIA_DEALER_DISCOVERY.md`.

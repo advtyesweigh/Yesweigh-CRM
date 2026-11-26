@@ -16,6 +16,7 @@ from app.crypto_util import decrypt_secret, encrypt_secret
 from app.dealer_exclusions import is_excluded_contact
 from app.models import Dealer, ZohoCreditNote, ZohoDealer, ZohoIntegration, ZohoSale
 from app.phone_util import normalize_in_mobile
+from app.state_normalize import canon_state
 
 ORG = "yesweigh"
 
@@ -433,11 +434,12 @@ async def upsert_dealer_from_contact(
     row.gst_no = str(contact.get("gst_no") or contact.get("tax_reg_no") or "")
     row.billing_city = _addr_field(contact, "city")
     # List API often omits billing_address; place_of_contact*_formatted is the GST state.
-    row.billing_state = (
+    raw_state = (
         _addr_field(contact, "state")
         or str(contact.get("place_of_contact_formatted") or "").strip()
         or str(contact.get("place_of_contact") or "").strip()
     )
+    row.billing_state = canon_state(raw_state) if raw_state else ""
     row.status = "excluded" if excluded else str(contact.get("status") or contact.get("contact_type") or "active")
     row.raw_json = json.dumps(contact, default=str)
     if not staging:
@@ -481,7 +483,9 @@ async def upsert_dealer_from_contact(
     dealer.phone = row.mobile or row.phone or normalize_in_mobile(dealer.phone)
     dealer.email = row.email or dealer.email
     dealer.city = row.billing_city or dealer.city
-    dealer.state = row.billing_state or dealer.state
+    incoming_state = (row.billing_state or "").strip()
+    if incoming_state:
+        dealer.state = canon_state(incoming_state)[:80]
     dealer.gstin = row.gst_no or dealer.gstin
     dealer.zoho_contact_id = cid
     dealer.source = dealer_source
@@ -695,7 +699,7 @@ async def enrich_dealer_cities(
         if st and (st.billing_city or "").strip():
             d.city = st.billing_city.strip()[:80]
             if (st.billing_state or "").strip() and not (d.state or "").strip():
-                d.state = st.billing_state.strip()[:80]
+                d.state = canon_state(st.billing_state.strip())[:80]
             copied += 1
     if copied:
         await db.commit()

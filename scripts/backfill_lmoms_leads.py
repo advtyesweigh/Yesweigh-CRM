@@ -20,7 +20,7 @@ from app.db import SessionLocal
 from app.models import Lead
 
 LMOMS_SOURCE = "LMOMS"
-KERALA_STATE = "Kerala"
+KERALA_STATE = "Keralam"
 
 CSV_FILES = [
     "LMOMS-Kerala-repairer-approved-list.csv",

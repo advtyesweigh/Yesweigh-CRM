@@ -246,17 +246,44 @@ function fmtQty(n: number | null | undefined) {
   return Math.round(n).toLocaleString("en-IN");
 }
 
+/** Calendar date in Asia/Kolkata (matches ADMS attendance timezone). */
 function todayISO() {
-  const d = new Date();
-  const off = d.getTimezoneOffset();
-  return new Date(d.getTime() - off * 60000).toISOString().slice(0, 10);
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
 }
 
 function addDaysISO(iso: string, delta: number) {
-  const d = new Date(`${iso}T12:00:00`);
-  d.setDate(d.getDate() + delta);
-  const off = d.getTimezoneOffset();
-  return new Date(d.getTime() - off * 60000).toISOString().slice(0, 10);
+  const d = new Date(`${iso}T12:00:00+05:30`);
+  d.setUTCDate(d.getUTCDate() + delta);
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(d);
+}
+
+const ATT_DAY_OFFSETS = [0, 1, 2, 3, 4, 5, 6] as const;
+
+function attDayButtonLabel(offset: number) {
+  return offset === 0 ? "Today" : `-${offset}D`;
+}
+
+function attDaySubtitle(offset: number, today: string) {
+  if (offset === 0) return "Today";
+  if (offset === 1) return "Yesterday";
+  const iso = addDaysISO(today, -offset);
+  const d = new Date(`${iso}T12:00:00+05:30`);
+  return d.toLocaleDateString("en-GB", {
+    timeZone: "Asia/Kolkata",
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+  });
 }
 
 function monthBounds(offset = 0): { from: string; to: string; label: string } {
@@ -536,6 +563,8 @@ export default function Dashboard() {
   const [att, setAtt] = useState<AdmsKpis | null>(null);
   const [attDetails, setAttDetails] = useState<AdmsDetailRow[]>([]);
   const [attTotal, setAttTotal] = useState(0);
+  const [attDayOffset, setAttDayOffset] = useState(0);
+  const [attDayLoading, setAttDayLoading] = useState(false);
   const [attWeek, setAttWeek] = useState<{ label: string; pct: number }[]>([]);
   const [salesByState, setSalesByState] = useState<{ state: string; sales_total: number }[]>([]);
   const [salesYear, setSalesYear] = useState(new Date().getFullYear());
@@ -546,6 +575,9 @@ export default function Dashboard() {
   const [skuModal, setSkuModal] = useState<SkuModalMode>(null);
   const [err, setErr] = useState("");
 
+  const attTodayIso = todayISO();
+  const attSubtitle = `${attDaySubtitle(attDayOffset, attTodayIso)} · ADMS`;
+
   useEffect(() => {
     let cancelled = false;
     async function load() {
@@ -553,91 +585,76 @@ export default function Dashboard() {
       setErr("");
       const today = todayISO();
       const weekFrom = addDaysISO(today, -6);
+      const year = new Date().getFullYear();
+      const fyYear = indianFyStartYear();
 
-      try {
-        const year = new Date().getFullYear();
-        const fyYear = indianFyStartYear();
-        const [
-          d,
-          leads,
-          waRes,
-          attToday,
-          attWeekRes,
-          salesState,
-          productRes,
-          overviewRes,
-          salesmanRes,
-          topDealersRes,
-        ] = await Promise.all([
-          // Timeouts so a hung WA/DB query cannot leave "Loading dashboard…" forever.
-          apiWithTimeout<DashboardOut>("/api/dashboard", 15000),
-          apiWithTimeout<LeadPage>("/api/leads?page=1&page_size=1", 15000),
-          apiWithTimeout<{ metrics: WaMetrics }>("/api/whatsapp/conversations?limit=1", 8000).catch(
-            () => null
-          ),
-          apiWithTimeout<AdmsDaily>(
-            `/api/integrations/adms/daily?date_from=${today}&date_to=${today}&page=1&page_size=200`,
-            12000
-          ).catch(() => null),
+      // Phase 1: core KPIs only — never block the page on ADMS/Zoho/WA.
+      const [d, leads] = await Promise.all([
+        apiWithTimeout<DashboardOut>("/api/dashboard", 12000).catch(() => null),
+        apiWithTimeout<LeadPage>("/api/leads?page=1&page_size=1", 12000).catch(() => null),
+      ]);
+      if (cancelled) return;
+      if (d) setDash(d);
+      if (leads) setStatusCounts(leads.status_counts || {});
+      if (!d && !leads) {
+        setErr("Request timed out after 12000ms");
+      }
+      setLoading(false);
+
+      // Phase 2: secondary widgets in parallel; each isolated with its own timeout.
+      // Daily attendance for the selected day is loaded in a separate effect (day filters).
+      const [waRes, attWeekRes, salesState, productRes, overviewRes, salesmanRes, topDealersRes] =
+        await Promise.all([
+          apiWithTimeout<{ metrics: WaMetrics }>("/api/whatsapp/conversations?limit=1", 8000).catch(() => null),
           apiWithTimeout<AdmsDaily>(
             `/api/integrations/adms/daily?date_from=${weekFrom}&date_to=${today}&page=1&page_size=500`,
-            12000
+            10000
           ).catch(() => null),
-          apiWithTimeout<SalesByStateOut>("/api/dealers/sales-by-state", 15000).catch(() => null),
-          apiWithTimeout<ProductSalesOut>(`/api/dashboard/sales-by-product?year=${year}&limit=10`, 15000).catch(
+          apiWithTimeout<SalesByStateOut>("/api/dealers/sales-by-state", 12000).catch(() => null),
+          apiWithTimeout<ProductSalesOut>(`/api/dashboard/sales-by-product?year=${year}&limit=10`, 12000).catch(
             () => null
           ),
-          apiWithTimeout<SalesOverviewOut>("/api/dashboard/sales-overview", 15000).catch(() => null),
+          apiWithTimeout<SalesOverviewOut>("/api/dashboard/sales-overview", 12000).catch(() => null),
           apiWithTimeout<SalesBySalesmanOut>(
             `/api/dashboard/sales-by-salesman?year=${fyYear}&limit=20`,
-            15000
+            12000
           ).catch(() => null),
-          apiWithTimeout<TopDealersYtdOut>(`/api/dashboard/top-dealers-ytd?year=${fyYear}&limit=6`, 15000).catch(
+          apiWithTimeout<TopDealersYtdOut>(`/api/dashboard/top-dealers-ytd?year=${fyYear}&limit=6`, 12000).catch(
             () => null
           ),
         ]);
 
-        if (cancelled) return;
-        setDash(d);
-        setStatusCounts(leads.status_counts || {});
-        setWa(waRes?.metrics || null);
-        setAtt(attToday?.kpis || null);
-        setAttDetails(sortByStaffDisplayOrder(attToday?.items || []));
-        setAttTotal(attToday?.total ?? attToday?.items?.length ?? 0);
-        setProductSales(productRes);
-        setSalesOverview(overviewRes);
-        setSalesBySalesman(salesmanRes);
-        setTopDealersYtd(topDealersRes);
+      if (cancelled) return;
+      setWa(waRes?.metrics || null);
+      setProductSales(productRes);
+      setSalesOverview(overviewRes);
+      setSalesBySalesman(salesmanRes);
+      setTopDealersYtd(topDealersRes);
 
-        const totalEmp = attToday?.kpis?.total_employees || d.employees_active || 1;
-        const byDay = new Map<string, number>();
-        for (const item of attWeekRes?.items || []) {
-          if (item.status === "On Time" || item.status === "Late") {
-            byDay.set(item.date_iso, (byDay.get(item.date_iso) || 0) + 1);
-          }
+      const totalEmp = attWeekRes?.kpis?.total_employees || d?.employees_active || 1;
+      const byDay = new Map<string, number>();
+      for (const item of attWeekRes?.items || []) {
+        if (item.status === "On Time" || item.status === "Late") {
+          byDay.set(item.date_iso, (byDay.get(item.date_iso) || 0) + 1);
         }
-        const weekBars: { label: string; pct: number }[] = [];
-        for (let i = 6; i >= 0; i--) {
-          const iso = addDaysISO(today, -i);
-          const present = byDay.get(iso) || 0;
-          const pct = Math.round((present / Math.max(1, totalEmp)) * 100);
-          const dObj = new Date(`${iso}T12:00:00`);
-          weekBars.push({
-            label: dObj.toLocaleString("en-GB", { weekday: "short" }),
-            pct: Math.min(100, pct),
-          });
-        }
-        setAttWeek(weekBars);
-        if (salesState) {
-          setSalesYear(salesState.year);
-          setSalesByState(salesState.items || []);
-        } else {
-          setSalesByState([]);
-        }
-      } catch (e) {
-        if (!cancelled) setErr(e instanceof Error ? e.message : "Failed to load dashboard");
-      } finally {
-        if (!cancelled) setLoading(false);
+      }
+      const weekBars: { label: string; pct: number }[] = [];
+      for (let i = 6; i >= 0; i--) {
+        const iso = addDaysISO(today, -i);
+        const present = byDay.get(iso) || 0;
+        const pct = Math.round((present / Math.max(1, totalEmp)) * 100);
+        const dObj = new Date(`${iso}T12:00:00+05:30`);
+        weekBars.push({
+          label: dObj.toLocaleString("en-GB", { timeZone: "Asia/Kolkata", weekday: "short" }),
+          pct: Math.min(100, pct),
+        });
+      }
+      setAttWeek(weekBars);
+      if (salesState) {
+        setSalesYear(salesState.year);
+        setSalesByState(salesState.items || []);
+      } else {
+        setSalesByState([]);
       }
     }
     load();
@@ -645,6 +662,27 @@ export default function Dashboard() {
       cancelled = true;
     };
   }, [range]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadAttDay() {
+      setAttDayLoading(true);
+      const day = addDaysISO(todayISO(), -attDayOffset);
+      const attDay = await apiWithTimeout<AdmsDaily>(
+        `/api/integrations/adms/daily?date_from=${day}&date_to=${day}&page=1&page_size=200`,
+        10000
+      ).catch(() => null);
+      if (cancelled) return;
+      setAtt(attDay?.kpis || null);
+      setAttDetails(sortByStaffDisplayOrder(attDay?.items || []));
+      setAttTotal(attDay?.total ?? attDay?.items?.length ?? 0);
+      setAttDayLoading(false);
+    }
+    loadAttDay();
+    return () => {
+      cancelled = true;
+    };
+  }, [attDayOffset]);
 
   const leadsTotal = dash?.leads_total ?? 0;
   const workOpen = dash?.work_open ?? 0;
@@ -708,7 +746,9 @@ export default function Dashboard() {
       value: fmtINRCompact(salesOverview?.this_month_total ?? 0),
       sub: salesOverview
         ? `${fmtNum(salesOverview.this_month_invoice_count)} invoices · MTD`
-        : "Loading Zoho sales…",
+        : loading
+          ? "Loading Zoho sales…"
+          : "Zoho sales unavailable",
       tone: (salesOverview?.this_month_total || 0) > 0 ? ("pos" as const) : ("muted" as const),
       icon: "₹",
       iconClass: "blue",
@@ -797,7 +837,7 @@ export default function Dashboard() {
           <div className="panelhead">
             <div>
               <h2>Staff Attendance</h2>
-              <p>Today · ADMS</p>
+              <p>{attSubtitle}</p>
             </div>
           </div>
           <div className="sd-att-body">
@@ -836,9 +876,29 @@ export default function Dashboard() {
           <div className="panelhead">
             <div>
               <h2>Attendance Records</h2>
-              <p>Today · ADMS</p>
+              <p>{attSubtitle}</p>
             </div>
-            <span className="adms-total-badge">Total: {fmtNum(attTotal)} Records</span>
+            <div className="sd-att-head-actions">
+              <div className="sd-att-day-filters" role="group" aria-label="Attendance day">
+                {ATT_DAY_OFFSETS.map((off) => (
+                  <button
+                    key={off}
+                    type="button"
+                    className={`sd-att-day-btn${attDayOffset === off ? " active" : ""}`}
+                    aria-pressed={attDayOffset === off}
+                    title={
+                      off === 0
+                        ? attTodayIso
+                        : `${attDaySubtitle(off, attTodayIso)} (${addDaysISO(attTodayIso, -off)})`
+                    }
+                    onClick={() => setAttDayOffset(off)}
+                  >
+                    {attDayButtonLabel(off)}
+                  </button>
+                ))}
+              </div>
+              <span className="adms-total-badge">Total: {fmtNum(attTotal)} Records</span>
+            </div>
           </div>
           <div className="adms-table-wrap sd-att-table-wrap">
             <table className="adms-att-table">
@@ -858,7 +918,7 @@ export default function Dashboard() {
                 {!attDetails.length && (
                   <tr>
                     <td colSpan={8} style={{ textAlign: "center", color: "var(--muted)", padding: 28 }}>
-                      {loading ? "Loading attendance…" : "No attendance for this date."}
+                      {loading || attDayLoading ? "Loading attendance…" : "No attendance for this date."}
                     </td>
                   </tr>
                 )}

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { api } from "../api/client";
 
 type CohortFilter = "" | "active" | "inactive";
@@ -290,9 +291,28 @@ function pageWindow(current: number, totalPages: number): (number | "…")[] {
   return out;
 }
 
+type DealerHealth = {
+  health_band: string;
+  active: boolean;
+  last_sale_date: string | null;
+  open_balance: number;
+  open_balance_note: string;
+  sales_fy: number;
+  sales_prior_fy: number;
+  invoice_count_12m: number;
+  open_service_threads: number;
+  unreplied_threads: number;
+  open_commitments: number;
+  why: string[];
+  active_rule: string;
+};
+
 export default function Dealers() {
-  const [searchInput, setSearchInput] = useState("");
-  const [q, setQ] = useState("");
+  const [params] = useSearchParams();
+  const initialQ = params.get("q") || "";
+  const [searchInput, setSearchInput] = useState(initialQ);
+  const [q, setQ] = useState(initialQ.trim());
+  const [health, setHealth] = useState<DealerHealth | null>(null);
   const [cohort, setCohort] = useState<CohortFilter>("");
   const [stateFilter, setStateFilter] = useState("");
   const [districtFilter, setDistrictFilter] = useState("");
@@ -603,7 +623,11 @@ export default function Dealers() {
     setDetailDealer(d);
     setDetail(null);
     setDetailErr("");
+    setHealth(null);
     setDetailLoading(true);
+    api<DealerHealth>(`/api/intel/dealers/${d.id}/health`)
+      .then(setHealth)
+      .catch(() => setHealth(null));
     try {
       const res = await api<ZohoDetail>(`/api/dealers/${d.id}/zoho`);
       setDetail(res);
@@ -618,6 +642,7 @@ export default function Dealers() {
     setDetailDealer(null);
     setDetail(null);
     setDetailErr("");
+    setHealth(null);
     setDetailLoading(false);
   }
 
@@ -1156,6 +1181,22 @@ export default function Dealers() {
                   <div className="dealer-zoho-banner">
                     {detail.fallback_reason}
                   </div>
+                ) : null}
+
+                {health ? (
+                  <section className="dealer-zoho-section">
+                    <h3>Health</h3>
+                    <p className="dealer-zoho-muted">
+                      {health.health_band} · {health.active ? "Active" : "Quiet"} · last sale {health.last_sale_date || "none"} · open balance ₹{Math.round(health.open_balance).toLocaleString("en-IN")}
+                    </p>
+                    <p className="dealer-zoho-muted">{health.open_balance_note}</p>
+                    <p className="dealer-zoho-muted">{health.active_rule}</p>
+                    <ul className="intel-why">
+                      {health.why.map((line) => (
+                        <li key={line}>{line}</li>
+                      ))}
+                    </ul>
+                  </section>
                 ) : null}
 
                 <section className="dealer-zoho-section">

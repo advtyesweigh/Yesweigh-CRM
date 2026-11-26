@@ -13,7 +13,9 @@ export const DISTRICT_ALIASES: Record<string, string[]> = data.districtAliases;
 
 export function districtsForState(state: string): string[] {
   if (!state) return [];
-  return DISTRICTS_BY_STATE[state] || [];
+  // Canonical CRM label is Keralam (Zoho historically used Kerala too).
+  const key = state === "Kerala" || state === "Keralam" ? "Keralam" : state;
+  return DISTRICTS_BY_STATE[key] || DISTRICTS_BY_STATE[state] || [];
 }
 
 export function districtMatchValues(district: string): string[] {

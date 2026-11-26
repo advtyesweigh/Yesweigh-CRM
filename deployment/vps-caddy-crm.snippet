@@ -1,0 +1,9 @@
+crm.yesweigh.in {
+	# API on 8100 survives web (nginx :8101) blips during compose deploy.
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8100
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8101
+	}
+}

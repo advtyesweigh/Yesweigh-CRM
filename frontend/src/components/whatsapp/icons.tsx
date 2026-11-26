@@ -155,6 +155,14 @@ export function PlusIcon(p: Props) {
   );
 }
 
+export function PaperclipIcon(p: Props) {
+  return (
+    <Icon {...p}>
+      <path d="m16 6-8.5 8.5a2.5 2.5 0 0 0 3.5 3.5l8.5-8.5a4 4 0 0 0-5.5-5.5L5 11" />
+    </Icon>
+  );
+}
+
 export function UserPlusIcon(p: Props) {
   return (
     <Icon {...p}>

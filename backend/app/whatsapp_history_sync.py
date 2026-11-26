@@ -455,23 +455,30 @@ async def run_history_sync(
                     continue
                 msg_id = None
                 from_me = None
-                # Prefer conversation already in DB for this jid/phone
-                conv = (
-                    await db.execute(
-                        select(WhatsAppConversation).where(
-                            WhatsAppConversation.whatsapp_instance_id == inst.id,
-                            or_(
-                                WhatsAppConversation.customer_jid == jid,
-                                WhatsAppConversation.customer_phone == row.get("phone"),
-                            ),
+                # Prefer conversation already in DB for this jid/phone.
+                # Duplicate jid/phone shells are common after contact+LID merges —
+                # never use scalar_one_or_none() here (crashes whole sync).
+                try:
+                    peers = (
+                        await db.execute(
+                            select(WhatsAppConversation).where(
+                                WhatsAppConversation.whatsapp_instance_id == inst.id,
+                                or_(
+                                    WhatsAppConversation.customer_jid == jid,
+                                    WhatsAppConversation.customer_phone == row.get("phone"),
+                                ),
+                            )
                         )
-                    )
-                ).scalar_one_or_none()
-                if conv:
-                    oldest = await _oldest_message_for_chat(db, inst.id, conv.id)
-                    if oldest and oldest.external_message_id:
-                        msg_id = oldest.external_message_id
-                        from_me = oldest.direction == "out"
+                    ).scalars().all()
+                    conv = _prefer_canonical_conversation(list(peers))
+                    if conv:
+                        oldest = await _oldest_message_for_chat(db, inst.id, conv.id)
+                        if oldest and oldest.external_message_id:
+                            msg_id = oldest.external_message_id
+                            from_me = oldest.direction == "out"
+                except Exception as exc:  # noqa: BLE001
+                    if len(stats["errors"]) < 40:
+                        stats["errors"].append(f"lookup {jid}: {exc}")
                 try:
                     await svc.request_history_sync(
                         token,

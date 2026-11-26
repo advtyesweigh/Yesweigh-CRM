@@ -6,6 +6,7 @@ Fingerprint gating keeps Gemini cost to one summary per conversation content ver
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from datetime import datetime, timezone
@@ -24,14 +25,14 @@ PROVIDER_META_CLOUD = "meta_cloud"
 
 
 def message_text_for_outline(msg: WhatsAppMessage) -> str:
-    """Prefer Sarvam transcript for voice; else body (skip empty media placeholders)."""
+    """Prefer Malayalam transcript for voice; for text include original + ml translation."""
     from app.ai.service import redact_secrets
 
     media_type = (msg.media_type or "").strip().lower()
     is_voice = media_type in {"audio", "ptt", "voice"} or bool(getattr(msg, "is_voice", False))
     transcript = (getattr(msg, "transcript", None) or "").strip()
     body = (msg.body or "").strip()
-    if is_voice or transcript:
+    if is_voice:
         if transcript:
             return f"[voice transcript] {redact_secrets(transcript)}"
         return "[voice message — no transcript yet]"
@@ -39,6 +40,8 @@ def message_text_for_outline(msg: WhatsAppMessage) -> str:
         return ""
     if body.startswith("📷") or body.startswith("🎥") or body.startswith("📄"):
         return ""
+    if transcript and transcript != body:
+        return redact_secrets(f"{body}\n[ml] {transcript}")
     return redact_secrets(body)
 
 
@@ -53,10 +56,13 @@ def outline_fingerprint(
     if not messages:
         return f"{OUTLINE_PROMPT_VERSION}:{lang}:empty"
     last = messages[-1]
-    return (
-        f"{OUTLINE_PROMPT_VERSION}:{lang}:{len(messages)}:"
-        f"{last.public_id}:{int(last.created_at.timestamp()) if last.created_at else 0}"
+    tail = (
+        f"{last.public_id}:"
+        f"{int(last.created_at.timestamp()) if last.created_at else 0}"
     )
+    digest = hashlib.sha256(tail.encode("utf-8")).hexdigest()[:16]
+    # Keep under DB VARCHAR(128); UUID+timestamp in cleartext exceeded VARCHAR(80).
+    return f"{OUTLINE_PROMPT_VERSION}:{lang}:{len(messages)}:{digest}"
 
 
 async def preferred_outline_language(db: AsyncSession, conv: WhatsAppConversation) -> str:
@@ -69,7 +75,13 @@ async def preferred_outline_language(db: AsyncSession, conv: WhatsAppConversatio
     4. Recent chat text already uses Malayalam script → ml
     5. Else staff preference (default English)
     """
-    from app.ai.service import normalize_staff_preferred_language, outline_has_malayalam_script
+    from app.ai.service import normalize_staff_preferred_language
+
+    from app.contact_spoken_language import (
+        chat_has_malayalam_from_text_only,
+        latest_inbound_spoken_language,
+        normalize_spoken_language_code,
+    )
 
     contact_raw = (getattr(conv, "language", None) or "").strip()
     contact_lang = normalize_staff_preferred_language(contact_raw)
@@ -94,11 +106,17 @@ async def preferred_outline_language(db: AsyncSession, conv: WhatsAppConversatio
         if not explicit_en:
             return "ml"
 
-    # Chat already in Malayalam script → summarise in Malayalam for agents.
+    spoken_contact = normalize_spoken_language_code(contact_raw)
+    if not spoken_contact:
+        spoken_contact = await latest_inbound_spoken_language(db, conv.id)
+    if spoken_contact and spoken_contact not in {"", "ml"}:
+        # Customer speaks Tamil/Telugu/etc.; translated voice transcripts must not force ml.
+        return staff_lang
+
+    # Plain-text Malayalam in chat (not translated voice) → summarise in Malayalam.
     try:
         messages = await load_recent_messages(db, conv, limit=20)
-        blob = "\n".join(message_text_for_outline(m) for m in messages)
-        if outline_has_malayalam_script(blob):
+        if chat_has_malayalam_from_text_only(messages):
             return "ml"
     except Exception:  # noqa: BLE001
         pass
@@ -175,6 +193,30 @@ async def refresh_conversation_outline(
         )
     if wrong_ml_script:
         log.info("invalidating non-Malayalam / wrong-script ml outline conv=%s", conv.id)
+
+    from app.intel.enquiry_list import rewrite_outline_if_needed, verdict_for
+
+    gate = await verdict_for(db, conv, [{"direction": m.direction or "", "text": message_text_for_outline(m) or ""} for m in messages])
+    if rewrite_outline_if_needed(conv, gate):
+        conv.ai_outline_fingerprint = fp
+        conv.ai_outline_at = datetime.now(timezone.utc)
+        await db.flush()
+        from app.whatsapp_service_meta import parse_cached_outline_summary as _parse_outline
+
+        summary = _parse_outline(conv.ai_outline or "")
+        return {
+            "outline": conv.ai_outline,
+            "summary": summary,
+            "stale": False,
+            "fingerprint": fp,
+            "preferred_language": preferred_language,
+            "generated_at": conv.ai_outline_at,
+            "last_message_id": messages[-1].public_id if messages else None,
+            "cached": False,
+            "skipped": False,
+            "model": None,
+            "ok": True,
+        }
 
     if cached and cached_fp == fp and not force and not legacy and not wrong_ml_script:
         payload = cached_summary_payload(conv)
@@ -285,6 +327,23 @@ async def refresh_conversation_outline(
     conv.ai_outline = outline
     conv.ai_outline_fingerprint = fp
     conv.ai_outline_at = datetime.now(timezone.utc)
+    from app.whatsapp_service_meta import apply_service_meta_to_conversation
+
+    apply_service_meta_to_conversation(
+        conv,
+        summary,
+        fallback_text=conv.last_message_preview or "",
+    )
+    from app.whatsapp_dealer_enquiry import apply_dealer_enquiry_actions, patch_outline_json
+
+    summary = await apply_dealer_enquiry_actions(db, conv, summary, messages)
+    apply_service_meta_to_conversation(
+        conv,
+        summary,
+        fallback_text=conv.last_message_preview or "",
+    )
+    outline = json.dumps(summary, ensure_ascii=False)
+    patch_outline_json(conv, summary)
     await db.flush()
     return {
         "outline": outline,

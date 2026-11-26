@@ -22,12 +22,17 @@ _WHATSAPP_PURPOSES = frozenset(
         "auto_reply",
         "lead_summary",
         "knowledge_search",
+        "knowledge_learning",
     }
 )
 
 
 def purpose_bucket(purpose: str) -> str:
     p = (purpose or "").strip().lower()
+    # Intel narration/ask uses ai_settings.intel_* caps (Phase B+). It must not
+    # share the whatsapp_outline / command bucket.
+    if p.startswith("intel_"):
+        return "intel"
     if p in _AGENT_PURPOSES or p.startswith("agent"):
         return "agent"
     if p in _WHATSAPP_PURPOSES or p.startswith("whatsapp_"):
@@ -233,6 +238,7 @@ async def usage_summary(db: AsyncSession, *, recent_limit: int = 50) -> dict:
             "whatsapp": {"requests": 0, "spend_inr": 0.0, "total_tokens": 0},
             "agent": {"requests": 0, "spend_inr": 0.0, "total_tokens": 0},
             "other": {"requests": 0, "spend_inr": 0.0, "total_tokens": 0},
+            "intel": {"requests": 0, "spend_inr": 0.0, "total_tokens": 0},
         }
         for purpose, cnt, spend, tot, inn, outn in rows:
             bucket = purpose_bucket(str(purpose or ""))

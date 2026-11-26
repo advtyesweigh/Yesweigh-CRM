@@ -128,38 +128,14 @@ def load_csv_rows(csv_dir: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
                 email = norm_text(row.get("email"))
                 city = norm_text(row.get("city") or row.get("town"))
                 district = norm_text(row.get("district"))
-                state = "Kerala"
-                app_id = norm_text(row.get("app_id"))
-                sl_no = norm_text(row.get("sl_no"))
-                approved = norm_text(row.get("approved_on"))
-                row_type = norm_text(row.get("type"))
+                state = "Keralam"
                 source = source_for_row(filename, row)
-                note_bits = []
-                if row_type:
-                    note_bits.append(f"role={row_type}")
-                elif "repairer" in filename:
-                    note_bits.append("role=repairer")
-                elif "dealer" in filename:
-                    note_bits.append("role=dealer")
-                elif "manufacturer" in filename and "dealers" not in filename:
-                    note_bits.append("role=manufacturer")
-                if district:
-                    note_bits.append(f"District: {district}")
-                if app_id:
-                    note_bits.append(f"app_id={app_id}")
-                if sl_no:
-                    note_bits.append(f"sl_no={sl_no}")
-                if approved:
-                    note_bits.append(f"approved={approved}")
-                note_bits.append(f"from={filename}")
-                notes = "; ".join(note_bits)
 
                 key = dedupe_key(phone, email, name, company)
                 if key in by_key:
                     stats["csv_dupes_merged"] += 1
                     cur = by_key[key]
                     cur["source"] = merge_sources(cur["source"], source)
-                    cur["notes"] = merge_notes(cur["notes"], notes)
                     if phone and not cur["phone"]:
                         cur["phone"] = phone[:40]
                     if email and not cur["email"]:
@@ -179,7 +155,7 @@ def load_csv_rows(csv_dir: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
                         "state": state,
                         "source": source[:80],
                         "status": "new",
-                        "notes": notes,
+                        "notes": "",
                         "_key": key,
                     }
 

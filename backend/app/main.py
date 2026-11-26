@@ -4,14 +4,21 @@ from contextlib import asynccontextmanager
 from typing import Annotated
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import adms_employees, adms_report, adms_sync
-from app.auth import create_access_token, get_current_user, verify_password
+from app.auth import (
+    clear_session_cookie,
+    get_current_user,
+    issue_mobile_session,
+    issue_user_session,
+    set_session_cookie,
+    verify_password,
+)
 from app.config import get_settings
 from app.db import get_db
 from app.employees import router as employees_router
@@ -19,8 +26,27 @@ from app.evolution import router as evolution_router
 from app.inbox import router as inbox_router
 from app.cloud_whatsapp import router as cloud_whatsapp_router
 from app.kerala_district_order import UNKNOWN_RANK, district_rank_whens
-from app.models import AdmsAttendanceLog, Employee, Lead, User, WorkItem
-from app.schemas import DashboardOut, LeadIn, LeadOut, LeadPage, LeadUpdate, TokenOut, UserOut, WorkIn, WorkOut
+from app.models import AdmsAttendanceLog, CustomAudience, Employee, Lead, User, WorkItem
+from app.lead_market_language import MARKET_LANGUAGE_TILES, lead_market_buckets
+from app.schemas import (
+    DashboardOut,
+    LeadByLanguageOut,
+    LeadByStateOut,
+    LeadIn,
+    LeadLanguageCountRow,
+    LeadMetaOut,
+    LeadOut,
+    LeadOwnerOption,
+    LeadPage,
+    LeadStateCountRow,
+    LeadUpdate,
+    TokenOut,
+    UserOut,
+    WorkIn,
+    WorkOut,
+)
+from app.phone_util import normalize_in_mobile, store_crm_phone
+from app.state_normalize import canon_state, lead_state_bucket, state_match_values_multi
 from app.vps_health import router as vps_health_router
 from app.catalog import router as catalog_router
 from app.dealers import router as dealers_router
@@ -29,6 +55,138 @@ from app.sales_stats import router as sales_stats_router
 from app.pincode import router as pincode_router
 from app.zoho import router as zoho_router
 from app.ai import router as ai_router
+from app.dealer_finder.router import router as dealer_finder_router
+from app.ai.learning_router import router as ai_learning_router
+from app.voice_clones import router as voice_clones_router
+from app.campaigns import router as campaigns_router
+from app.audiences import router as audiences_router
+from app.intel.router import router as intel_router
+from app.call_logs import router as call_logs_router
+from app.db import SessionLocal
+from app.permissions import campaigns_only_path_allowed, is_campaigns_only, optional_user_from_request
+
+LEAD_NULLABLE_FIELDS = frozenset(
+    {"owner_id", "estimated_value", "next_follow_up", "last_contacted", "lead_score"}
+)
+LEAD_BUSINESS_TYPES = [
+    "Weighing Equipment Dealer",
+    "Retailer",
+    "Distributor",
+    "Manufacturer",
+    "End User / Industry",
+    "Service Provider",
+    "Other",
+]
+LEAD_SOURCES = [
+    "Website Enquiry",
+    "WhatsApp",
+    "Visiting Card",
+    "Phone Call",
+    "Google Ads",
+    "Referral",
+    "Trade Show",
+    "Walk-in",
+    "LMOMS",
+    "manual",
+    "Other",
+]
+LEAD_STATUSES = ["new", "contacted", "qualified", "won", "lost"]
+LEAD_PRIORITIES = ["low", "medium", "high", "urgent"]
+LEAD_PRODUCT_CATEGORIES = [
+    "Electronic Weighing Scales",
+    "Bench Scale",
+    "Label Scale",
+    "Platform Scale",
+    "Price Computing",
+    "POS / Billing",
+    "Others",
+]
+LEAD_TAG_SUGGESTIONS = [
+    "Industrial",
+    "Price Enquiry",
+    "Hot Lead",
+    "Dealer",
+    "Follow-up",
+    "Retail",
+]
+LEAD_CAMPAIGN_DEFAULTS = [
+    "Google Ads – Weighing Scales",
+    "WhatsApp Outreach",
+    "Website Enquiry",
+    "Trade Show",
+]
+
+
+def _lead_out(lead: Lead, owner_name: str = "") -> LeadOut:
+    data = LeadOut.model_validate(lead)
+    data.owner_name = owner_name or ""
+    return data
+
+
+async def _owner_names(db: AsyncSession, owner_ids: set[int]) -> dict[int, str]:
+    ids = [i for i in owner_ids if i]
+    if not ids:
+        return {}
+    rows = (await db.execute(select(User.id, User.name).where(User.id.in_(ids)))).all()
+    return {int(i): (n or "") for i, n in rows}
+
+
+def _normalize_lead_phone_fields(data: dict) -> None:
+    if "phone" in data and data.get("phone") is not None:
+        data["phone"] = store_crm_phone(str(data["phone"]))
+
+
+def _apply_lead_patch(lead: Lead, data: dict) -> None:
+    if "state" in data and data["state"] is not None:
+        data["state"] = canon_state(str(data["state"]))
+    if "pin" in data and data["pin"] is not None:
+        data["pin"] = "".join(c for c in str(data["pin"]) if c.isdigit())[:20]
+    _normalize_lead_phone_fields(data)
+    for key in ("estimated_value", "next_follow_up", "last_contacted", "owner_id", "lead_score"):
+        if key in data and data[key] == "":
+            data[key] = None
+    for k, v in data.items():
+        if k in LEAD_NULLABLE_FIELDS:
+            setattr(lead, k, v)
+        else:
+            setattr(lead, k, v if v is not None else "")
+
+
+async def _lead_campaigns(db: AsyncSession) -> list[str]:
+    rows = (
+        await db.execute(
+            select(Lead.campaign)
+            .where(Lead.campaign != "")
+            .distinct()
+            .order_by(Lead.campaign.asc())
+            .limit(100)
+        )
+    ).scalars().all()
+    seen = {c for c in LEAD_CAMPAIGN_DEFAULTS}
+    out = list(LEAD_CAMPAIGN_DEFAULTS)
+    for c in rows:
+        name = (c or "").strip()
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+async def _lead_tag_suggestions(db: AsyncSession) -> list[str]:
+    rows = (
+        await db.execute(
+            select(Lead.tags).where(Lead.tags != "").limit(300)
+        )
+    ).scalars().all()
+    seen = {t for t in LEAD_TAG_SUGGESTIONS}
+    out = list(LEAD_TAG_SUGGESTIONS)
+    for raw in rows:
+        for part in str(raw or "").replace(";", ",").split(","):
+            tag = part.strip()
+            if tag and tag not in seen:
+                seen.add(tag)
+                out.append(tag)
+    return out[:80]
 
 settings = get_settings()
 
@@ -36,6 +194,24 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     adms_sync.start_background_sync()
+    try:
+        from app.paced_media_batch import start_paced_media_worker
+
+        start_paced_media_worker()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from app.dealer_finder.jobs import start_dealer_finder_worker
+
+        start_dealer_finder_worker()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from app.intel.jobs import start_intel_worker
+
+        start_intel_worker()
+    except Exception:  # noqa: BLE001
+        pass
     # Orphaned AI runs stay "running" forever after API restart — fail them so /work stops polling.
     try:
         from app.ai.service import recover_stale_runs_on_startup
@@ -44,6 +220,24 @@ async def lifespan(_app: FastAPI):
     except Exception:  # noqa: BLE001
         pass
     yield
+    try:
+        from app.intel.jobs import stop_intel_worker
+
+        await stop_intel_worker()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from app.dealer_finder.jobs import stop_dealer_finder_worker
+
+        await stop_dealer_finder_worker()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from app.paced_media_batch import stop_paced_media_worker
+
+        await stop_paced_media_worker()
+    except Exception:  # noqa: BLE001
+        pass
     await adms_sync.stop_background_sync()
 
 
@@ -55,6 +249,29 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def campaigns_only_access_middleware(request: Request, call_next):
+    path = request.url.path
+    if request.method == "OPTIONS" or not path.startswith("/api/"):
+        return await call_next(request)
+    # Durable media URLs open in new tabs without session cookies; never block on role.
+    if path.startswith("/api/whatsapp/media/"):
+        return await call_next(request)
+    if campaigns_only_path_allowed(path):
+        return await call_next(request)
+    async with SessionLocal() as db:
+        user = await optional_user_from_request(request, db)
+    if user and is_campaigns_only(user) and not campaigns_only_path_allowed(path):
+        return Response(
+            content='{"detail":"Access limited to Campaigns"}',
+            status_code=403,
+            media_type="application/json",
+        )
+    return await call_next(request)
+
+
 app.include_router(employees_router)
 app.include_router(evolution_router)
 app.include_router(inbox_router)
@@ -67,19 +284,20 @@ app.include_router(sales_products_router)
 app.include_router(sales_stats_router)
 app.include_router(pincode_router)
 app.include_router(ai_router)
+app.include_router(dealer_finder_router)
+app.include_router(ai_learning_router)
+app.include_router(voice_clones_router)
+app.include_router(campaigns_router)
+app.include_router(audiences_router)
+app.include_router(intel_router)
+app.include_router(call_logs_router)
 
 Db = Annotated[AsyncSession, Depends(get_db)]
 CurrentUser = Annotated[User, Depends(get_current_user)]
 
 
-@app.get("/api/health")
-async def health():
-    return {"ok": True, "app": settings.app_name}
-
-
-@app.post("/api/auth/login", response_model=TokenOut)
-async def login(form: Annotated[OAuth2PasswordRequestForm, Depends()], db: Db):
-    username = (form.username or "").strip()
+async def _authenticate_login_user(db: AsyncSession, username_raw: str, password: str) -> User:
+    username = (username_raw or "").strip()
     # Allow Aadhaar (digits) or email as login id
     if username.isdigit():
         username = "".join(ch for ch in username if ch.isdigit())
@@ -90,10 +308,50 @@ async def login(form: Annotated[OAuth2PasswordRequestForm, Depends()], db: Db):
         ).scalar_one_or_none()
         if emp and emp.user_id:
             user = await db.get(User, emp.user_id)
-    if not user or not verify_password(form.password, user.password_hash):
+    if not user or not verify_password(password, user.password_hash):
         raise HTTPException(401, "Invalid email or password")
-    token = create_access_token(user.email)
+    if not user.is_active:
+        raise HTTPException(401, "Account disabled")
+    return user
+
+
+@app.get("/api/health")
+async def health():
+    return {"ok": True, "app": settings.app_name}
+
+
+@app.post("/api/auth/login", response_model=TokenOut)
+async def login(
+    form: Annotated[OAuth2PasswordRequestForm, Depends()],
+    db: Db,
+    response: Response,
+):
+    user = await _authenticate_login_user(db, form.username or "", form.password or "")
+    # One user = one web session: new login revokes every prior token for this account.
+    token = await issue_user_session(user, db)
+    set_session_cookie(response, token)
     return TokenOut(access_token=token, name=user.name, email=user.email, role=user.role)
+
+
+@app.post("/api/auth/mobile-login", response_model=TokenOut)
+async def mobile_login(
+    form: Annotated[OAuth2PasswordRequestForm, Depends()],
+    db: Db,
+):
+    """YES CRM Android login — same credentials, separate mobile session (web stays signed in)."""
+    user = await _authenticate_login_user(db, form.username or "", form.password or "")
+    token = await issue_mobile_session(user, db)
+    return TokenOut(access_token=token, name=user.name, email=user.email, role=user.role)
+
+
+@app.post("/api/auth/logout")
+async def logout(response: Response, user: CurrentUser, db: Db):
+    """Clear cookie and revoke the current session so the token cannot be reused."""
+    user.session_version = int(user.session_version or 0) + 1
+    user.active_session_id = ""
+    await db.commit()
+    clear_session_cookie(response)
+    return {"ok": True}
 
 
 @app.get("/api/me", response_model=UserOut)
@@ -139,14 +397,6 @@ _DISTRICT_ALIASES: dict[str, list[str]] = {
     "thiruvanathapuram": ["Thiruvananthapuram", "Thiruvanathapuram", "Trivandrum"],
     "trivandrum": ["Thiruvananthapuram", "Thiruvanathapuram", "Trivandrum"],
 }
-_STATE_ALIASES: dict[str, list[str]] = {
-    "uttarakhand": ["Uttarakhand", "Uttaranchal"],
-    "uttaranchal": ["Uttarakhand", "Uttaranchal"],
-    "andaman and nicobar": ["Andaman and Nicobar", "Andaman and Nicobar Islands"],
-    "andaman and nicobar islands": ["Andaman and Nicobar", "Andaman and Nicobar Islands"],
-}
-
-
 def _alias_values(raw: str, table: dict[str, list[str]]) -> list[str]:
     term = (raw or "").strip()
     if not term:
@@ -173,8 +423,9 @@ async def list_leads(
     status: str = "",
     state: str = "",
     district: str = "",
+    language: str = "",
 ):
-    """Paginated leads with text search, status, and cascading state/district filters."""
+    """Paginated leads with text search, status, state/district, and business-language filters."""
     size = limit if limit is not None else page_size
     size = max(1, min(size, 200))
     page = max(1, page)
@@ -194,9 +445,10 @@ async def list_leads(
                     Lead.pin.ilike(pattern),
                 )
             )
-        state_vals = _alias_values(state, _STATE_ALIASES)
-        if state_vals:
-            stmt = stmt.where(or_(*[Lead.state.ilike(v) for v in state_vals]))
+        if (state or "").strip():
+            state_vals = state_match_values_multi(state)
+            if state_vals:
+                stmt = stmt.where(or_(*[Lead.state.ilike(v) for v in state_vals]))
         district_vals = _alias_values(district, _DISTRICT_ALIASES)
         if district_vals:
             stmt = stmt.where(or_(*[Lead.district.ilike(v) for v in district_vals]))
@@ -206,11 +458,17 @@ async def list_leads(
                 stmt = stmt.where(func.lower(Lead.status) == st)
         return stmt
 
-    # Tile counts honor search + geo, but not the active status tile.
+    lang = (language or "").strip()
+
+    # Tile counts honor search + geo (+ language when set), but not the active status tile.
     counts_base = apply_filters(
         select(Lead.status, func.count()).group_by(Lead.status),
         include_status=False,
     )
+    if lang:
+        from app.lead_market_language import apply_lead_language_filter
+
+        counts_base = await apply_lead_language_filter(counts_base, db, lang)
     count_rows = (await db.execute(counts_base)).all()
     status_counts = {str(s or ""): int(n) for s, n in count_rows}
     for key in ("new", "contacted", "qualified", "won", "lost"):
@@ -218,6 +476,11 @@ async def list_leads(
 
     query = apply_filters(select(Lead), include_status=True)
     count_query = apply_filters(select(func.count()).select_from(Lead), include_status=True)
+    if lang:
+        from app.lead_market_language import apply_lead_language_filter
+
+        query = await apply_lead_language_filter(query, db, lang)
+        count_query = await apply_lead_language_filter(count_query, db, lang)
 
     total = (await db.execute(count_query)).scalar() or 0
     offset = (page - 1) * size
@@ -230,12 +493,80 @@ async def list_leads(
             .limit(size)
         )
     ).scalars().all()
+    owners = await _owner_names(db, {int(r.owner_id) for r in rows if r.owner_id})
     return LeadPage(
-        items=rows,
+        items=[_lead_out(r, owners.get(int(r.owner_id or 0), "")) for r in rows],
         total=total,
         page=page,
         page_size=size,
         status_counts=status_counts,
+    )
+
+
+@app.get("/api/leads/by-state", response_model=LeadByStateOut)
+async def leads_by_state(
+    db: Db,
+    user: CurrentUser,
+    status: str = "",
+):
+    """Lead counts per state (Kerala/Keralam merged) for map and state chips."""
+    stmt = select(Lead.state, func.count()).group_by(Lead.state)
+    st = (status or "").strip().lower()
+    if st and st != "all":
+        stmt = stmt.where(func.lower(Lead.status) == st)
+    rows = (await db.execute(stmt)).all()
+    buckets: dict[str, int] = {}
+    for state_raw, n in rows:
+        label = lead_state_bucket(str(state_raw or ""))
+        if not label:
+            continue
+        buckets[label] = buckets.get(label, 0) + int(n or 0)
+    items = [
+        LeadStateCountRow(state=k, lead_count=v)
+        for k, v in sorted(buckets.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+    total = sum(buckets.values())
+    return LeadByStateOut(items=items, total=total)
+
+
+@app.get("/api/leads/by-language", response_model=LeadByLanguageOut)
+async def leads_by_language(
+    db: Db,
+    user: CurrentUser,
+    status: str = "",
+):
+    """Lead counts per business language market (summed from Lead.state mapping)."""
+    buckets, total, with_language = await lead_market_buckets(db, status=status)
+    items = [
+        LeadLanguageCountRow(
+            language=code,
+            iso=iso,
+            label=label,
+            lead_count=buckets.get(code, 0),
+        )
+        for code, iso, label in MARKET_LANGUAGE_TILES
+    ]
+    return LeadByLanguageOut(items=items, total=total, with_language=with_language)
+
+
+@app.get("/api/leads/meta", response_model=LeadMetaOut)
+async def leads_meta(db: Db, user: CurrentUser):
+    """Dropdown options for the Edit Lead form."""
+    owner_rows = (
+        await db.execute(select(User).order_by(User.name.asc()).limit(200))
+    ).scalars().all()
+    return LeadMetaOut(
+        owners=[
+            LeadOwnerOption(id=u.id, name=u.name or u.email or f"User {u.id}", role=u.role or "")
+            for u in owner_rows
+        ],
+        business_types=list(LEAD_BUSINESS_TYPES),
+        sources=list(LEAD_SOURCES),
+        statuses=list(LEAD_STATUSES),
+        priorities=list(LEAD_PRIORITIES),
+        product_categories=list(LEAD_PRODUCT_CATEGORIES),
+        campaigns=await _lead_campaigns(db),
+        tag_suggestions=await _lead_tag_suggestions(db),
     )
 
 
@@ -244,11 +575,20 @@ async def create_lead(body: LeadIn, db: Db, user: CurrentUser):
     data = body.model_dump()
     if not (data.get("name") or "").strip() and not (data.get("company") or "").strip():
         raise HTTPException(400, "Name or company is required")
-    lead = Lead(**data, owner_id=user.id)
+    if data.get("state"):
+        data["state"] = canon_state(str(data["state"]))
+    if data.get("pin"):
+        data["pin"] = "".join(c for c in str(data["pin"]) if c.isdigit())[:20]
+    # Lead Owner / Source / Product Category are optional — leave owner unset when blank.
+    if data.get("owner_id") in (None, "", 0):
+        data["owner_id"] = None
+    _normalize_lead_phone_fields(data)
+    lead = Lead(**data)
     db.add(lead)
     await db.commit()
     await db.refresh(lead)
-    return lead
+    owners = await _owner_names(db, {int(lead.owner_id)} if lead.owner_id else set())
+    return _lead_out(lead, owners.get(int(lead.owner_id or 0), ""))
 
 
 @app.post("/api/leads/import", response_model=dict)
@@ -257,8 +597,7 @@ async def import_leads(body: list[LeadIn], db: Db, user: CurrentUser):
     existing = (await db.execute(select(Lead))).scalars().all()
 
     def _phone(v: str) -> str:
-        digits = "".join(c for c in (v or "") if c.isdigit())
-        return digits[-10:] if len(digits) >= 10 else digits
+        return normalize_in_mobile(v or "")
 
     def _email(v: str) -> str:
         return (v or "").strip().lower()
@@ -286,7 +625,9 @@ async def import_leads(body: list[LeadIn], db: Db, user: CurrentUser):
         if key in seen:
             skipped += 1
             continue
-        db.add(Lead(**item.model_dump(), owner_id=user.id))
+        row = item.model_dump()
+        _normalize_lead_phone_fields(row)
+        db.add(Lead(**row, owner_id=user.id))
         seen.add(key)
         inserted += 1
     await db.commit()
@@ -304,13 +645,11 @@ async def update_lead(lead_id: int, body: LeadUpdate, db: Db, user: CurrentUser)
         company = data.get("company", lead.company)
         if not (name or "").strip() and not (company or "").strip():
             raise HTTPException(400, "Name or company is required")
-    if "pin" in data and data["pin"] is not None:
-        data["pin"] = "".join(c for c in str(data["pin"]) if c.isdigit())[:20]
-    for k, v in data.items():
-        setattr(lead, k, v if v is not None else "")
+    _apply_lead_patch(lead, data)
     await db.commit()
     await db.refresh(lead)
-    return lead
+    owners = await _owner_names(db, {int(lead.owner_id)} if lead.owner_id else set())
+    return _lead_out(lead, owners.get(int(lead.owner_id or 0), ""))
 
 
 @app.delete("/api/leads/{lead_id}", status_code=204)

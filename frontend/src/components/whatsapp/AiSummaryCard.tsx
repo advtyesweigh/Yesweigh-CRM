@@ -12,6 +12,7 @@ import {
   TargetIcon,
   ZapIcon,
 } from "./icons";
+import { serviceCategoryClass, serviceCategoryLabel } from "../../lib/whatsappServiceMeta";
 
 export type AiSummary = {
   topic?: string;
@@ -23,6 +24,11 @@ export type AiSummary = {
   important_information?: string[];
   recommended_action?: string;
   followup_priority?: string;
+  service_category?: string;
+  enquiry_subtype?: string;
+  sales_attended?: string;
+  sales_attended_by?: string;
+  sales_attended_at?: string | null;
   suggested_followup_at?: string | null;
   language?: string;
   updated_at?: string;
@@ -139,6 +145,45 @@ export default function AiSummaryCard({ summary, loading, error, stale, generate
             </div>
             <div className="wa-ai-value">{display(summary?.current_issue)}</div>
           </div>
+          {serviceCategoryLabel(summary?.service_category) ? (
+            <div className="wa-ai-row">
+              <div className="wa-ai-label">
+                <span className="wa-ai-ico"><PackageIcon /></span>
+                Type
+              </div>
+              <div className="wa-ai-value">
+                <span className={`wa-tag wa-svc-cat ${serviceCategoryClass(summary?.service_category)}`}>
+                  {serviceCategoryLabel(summary?.service_category)}
+                </span>
+                {(summary?.enquiry_subtype || "").trim().toLowerCase() === "dealer enquiry" ? (
+                  <span className="wa-tag lead" style={{ marginLeft: 8 }}>
+                    Dealer enquiry
+                  </span>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
+          {(summary?.sales_attended || "").trim() ? (
+            <div className="wa-ai-row">
+              <div className="wa-ai-label">
+                <span className="wa-ai-ico"><ActivityIcon /></span>
+                Sales attended
+              </div>
+              <div className="wa-ai-value">
+                <span
+                  className={`wa-status-pill ${(summary?.sales_attended || "").toLowerCase() === "yes" ? "ok" : "warn"}`}
+                >
+                  {(summary?.sales_attended || "").toLowerCase() === "yes" ? "Yes" : "No"}
+                </span>
+                {summary?.sales_attended_by ? (
+                  <span style={{ marginLeft: 8, fontSize: "0.9em" }}>
+                    {summary.sales_attended_by}
+                    {summary.sales_attended_at ? ` · ${fmtUpdated(summary.sales_attended_at)}` : null}
+                  </span>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
           <div className="wa-ai-row">
             <div className="wa-ai-label">
               <span className="wa-ai-ico"><ActivityIcon /></span>

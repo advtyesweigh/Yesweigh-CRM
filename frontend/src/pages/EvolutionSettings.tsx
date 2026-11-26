@@ -65,6 +65,8 @@ export default function EvolutionSettings() {
   const [enabled, setEnabled] = useState(true);
   const [items, setItems] = useState<Instance[]>([]);
   const [stats, setStats] = useState<Stats>({ total: 0, connected: 0, disconnected: 0, unassigned: 0 });
+  const [instancesLoading, setInstancesLoading] = useState(true);
+  const [instancesError, setInstancesError] = useState("");
   const [toast, setToast] = useState("");
   const [saving, setSaving] = useState(false);
   const [modalOpen, setModalOpen] = useState(false);
@@ -100,9 +102,19 @@ export default function EvolutionSettings() {
   }
 
   async function loadInstances() {
-    const res = await api<{ items: Instance[]; stats: Stats }>("/api/whatsapp/instances");
-    setItems(res.items);
-    setStats(res.stats);
+    setInstancesLoading(true);
+    setInstancesError("");
+    try {
+      const res = await api<{ items: Instance[]; stats: Stats }>("/api/whatsapp/instances");
+      setItems(res.items);
+      setStats(res.stats);
+    } catch (e) {
+      setInstancesError(e instanceof Error ? e.message : "Instances load failed");
+      // Keep prior items if any; do not pretend the org has zero instances.
+      throw e;
+    } finally {
+      setInstancesLoading(false);
+    }
   }
 
   async function loadEligible() {
@@ -420,7 +432,16 @@ export default function EvolutionSettings() {
           </div>
 
           <section className="panel">
-            {items.length === 0 ? (
+            {instancesLoading ? (
+              <div className="emp-empty">Loading WhatsApp instances…</div>
+            ) : instancesError ? (
+              <div className="emp-empty" style={{ color: "#b91c1c" }}>
+                Could not load instances ({instancesError}).{" "}
+                <button type="button" className="btn" onClick={() => loadInstances().catch((e) => showToast(e instanceof Error ? e.message : "Instances load failed"))}>
+                  Retry
+                </button>
+              </div>
+            ) : items.length === 0 ? (
               <div className="emp-empty">No YesWeigh WhatsApp instances yet. Create one to get started.</div>
             ) : (
               <div className="tablewrap">

@@ -64,6 +64,29 @@ class GeminiProvider(AIProvider):
             text = msg.get("content")
             if text:
                 parts.append(types.Part.from_text(text=str(text)))
+            # Optional inline images from /work attach (base64 + mime).
+            for img in msg.get("images") or []:
+                if not isinstance(img, dict):
+                    continue
+                raw_b64 = str(img.get("data") or "").strip()
+                mime = str(img.get("mime") or "image/jpeg").strip() or "image/jpeg"
+                if not raw_b64:
+                    continue
+                try:
+                    blob = base64.b64decode(raw_b64, validate=False)
+                except Exception:  # noqa: BLE001
+                    continue
+                if not blob or len(blob) > 3_500_000:
+                    continue
+                try:
+                    parts.append(types.Part.from_bytes(data=blob, mime_type=mime))
+                except Exception:  # noqa: BLE001
+                    # Older SDK fallback
+                    parts.append(
+                        types.Part(
+                            inline_data=types.Blob(mime_type=mime, data=blob),
+                        )
+                    )
             for tc in msg.get("tool_calls") or []:
                 part = types.Part.from_function_call(
                     name=tc.get("name") or "",

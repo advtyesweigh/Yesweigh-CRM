@@ -1,7 +1,10 @@
-import { useEffect, useMemo, useState, type ComponentType } from "react";
+import { useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api } from "../../api/client";
+import { formatLanguageLabel } from "../../lib/languageDisplay";
+import AiReplyAssistant from "./AiReplyAssistant";
 import AiSummaryCard, { type AiSummary } from "./AiSummaryCard";
+import { formatInr } from "../BusinessReportCard";
 import {
   CalendarIcon,
   CheckCircleIcon,
@@ -21,6 +24,14 @@ export type DealerBrief = {
   code?: string;
   city?: string;
   state?: string;
+  total_sales?: number;
+};
+
+export type OnboardingBrief = {
+  step?: string;
+  lead_id?: number | null;
+  at?: string | null;
+  ran?: boolean;
 };
 
 export type ConvBrief = {
@@ -39,6 +50,9 @@ export type ConvBrief = {
   customer_type?: string;
   dealer_id?: number | null;
   dealer?: DealerBrief | null;
+  onboarding_step?: string;
+  onboarding_lead_id?: number | null;
+  onboarding?: OnboardingBrief | null;
 };
 
 export type MsgBrief = {
@@ -82,7 +96,9 @@ type Props = {
     color?: string;
     size?: number;
     className?: string;
+    onPhotoClick?: () => void;
   }>;
+  onViewContactPhoto?: (photo: string, name?: string) => void;
   dealerSearchOpen: boolean;
   setDealerSearchOpen: (v: boolean) => void;
   dealerQ: string;
@@ -92,11 +108,15 @@ type Props = {
   selectedDealerId: number | null;
   setSelectedDealerId: (v: number | null) => void;
   linkingDealer: boolean;
-  searchDealers: (q: string) => Promise<void>;
+  delinkingDealer: boolean;
+  openLinkDealerPanel: () => void;
   linkSelectedDealer: () => Promise<void>;
+  delinkDealer: () => Promise<void>;
   onEditContact: () => void;
+  onMarkSpam?: () => void;
   onToast: (msg: string) => void;
   onRefreshConv: () => Promise<void>;
+  onUseAiReply?: (text: string) => void;
   fmtTime: (v?: string | null) => string;
 };
 
@@ -123,6 +143,7 @@ export default function RightPanel(props: Props) {
     outlineStale,
     onRegenerate,
     WaDp,
+    onViewContactPhoto,
     dealerSearchOpen,
     setDealerSearchOpen,
     dealerQ,
@@ -132,11 +153,15 @@ export default function RightPanel(props: Props) {
     selectedDealerId,
     setSelectedDealerId,
     linkingDealer,
-    searchDealers,
+    delinkingDealer,
+    openLinkDealerPanel,
     linkSelectedDealer,
+    delinkDealer,
     onEditContact,
+    onMarkSpam,
     onToast,
     onRefreshConv,
+    onUseAiReply,
     fmtTime,
   } = props;
   const navigate = useNavigate();
@@ -148,6 +173,7 @@ export default function RightPanel(props: Props) {
   const [related, setRelated] = useState<RelatedPayload | null>(null);
   const [relatedLoading, setRelatedLoading] = useState(false);
   const [noteDraft, setNoteDraft] = useState("");
+  const dealerSearchRef = useRef<HTMLInputElement | null>(null);
   const [noteSaving, setNoteSaving] = useState(false);
   const [taskBusy, setTaskBusy] = useState(false);
   const [leadBusy, setLeadBusy] = useState(false);
@@ -222,6 +248,20 @@ export default function RightPanel(props: Props) {
     if (activityFilter === "all") return activities;
     return activities.filter((a) => a.filter === activityFilter);
   }, [activities, activityFilter]);
+
+  const profileCityState = useMemo(() => {
+    if (!conv) return "";
+    const parts = [conv.dealer?.city, conv.dealer?.state]
+      .map((x) => (x || "").trim())
+      .filter(Boolean);
+    if (parts.length) return parts.join(", ");
+    return (conv.region || "").trim();
+  }, [conv?.dealer?.city, conv?.dealer?.state, conv?.region]);
+
+  const profileLanguage = useMemo(() => {
+    const label = formatLanguageLabel(conv?.language);
+    return label || "—";
+  }, [conv?.language]);
 
   async function createTask() {
     if (!conv) return;
@@ -355,13 +395,21 @@ export default function RightPanel(props: Props) {
     }
   }
 
+  useEffect(() => {
+    if (!dealerSearchOpen) return;
+    const t = window.setTimeout(() => dealerSearchRef.current?.focus(), 40);
+    return () => window.clearTimeout(t);
+  }, [dealerSearchOpen]);
+
+  function closeLinkDealer() {
+    setDealerSearchOpen(false);
+    setSelectedDealerId(null);
+  }
+
   function openLinkDealer() {
     if (!conv) return;
-    setDealerSearchOpen(true);
-    setDealerQ(conv.customer_phone || "");
-    setSelectedDealerId(null);
-    searchDealers(conv.customer_phone || "").catch(() => null);
     setTab("Customer");
+    openLinkDealerPanel();
   }
 
   return (
@@ -387,28 +435,76 @@ export default function RightPanel(props: Props) {
         ) : tab === "Customer" ? (
           <>
             <section className="wa-card wa-profile-card">
-              <WaDp photo={conv.customer_photo} initial={conv.initial} color={conv.color} size={40} />
+              <WaDp
+                photo={conv.customer_photo}
+                initial={conv.initial}
+                color={conv.color}
+                size={40}
+                onPhotoClick={
+                  conv.customer_photo
+                    ? () => onViewContactPhoto?.(conv.customer_photo!, conv.display_name || conv.customer_phone)
+                    : undefined
+                }
+              />
               <div className="wa-profile-main">
                 <div className="wa-profile-top">
                   <b>{conv.display_name || conv.customer_phone}</b>
                   <span className={`wa-tag ${conv.dealer ? "dealer" : "new"}`}>
                     {conv.dealer ? "Dealer" : conv.customer_type || "Customer"}
                   </span>
+                  {(conv.onboarding?.ran || conv.onboarding_step) && (
+                    <span
+                      className="wa-tag new"
+                      title={
+                        conv.onboarding?.lead_id
+                          ? `Lead #${conv.onboarding.lead_id}`
+                          : conv.onboarding_step || conv.onboarding?.step || "ran"
+                      }
+                    >
+                      Auto:{" "}
+                      {(conv.onboarding?.step || conv.onboarding_step || "ran").replace(/_/g, " ")}
+                    </span>
+                  )}
                 </div>
+                {conv.dealer && conv.dealer.total_sales != null ? (
+                  <p className="wa-dealer-sales-total">
+                    Sales{" "}
+                    <span className="wa-dealer-sales-amount">
+                      {formatInr(conv.dealer.total_sales)}
+                    </span>
+                  </p>
+                ) : null}
+                {profileCityState ? (
+                  <p className="wa-profile-place">{profileCityState}</p>
+                ) : null}
                 <p>{conv.customer_phone}</p>
                 <div className="wa-profile-grid">
                   <span>Account</span>
                   <span>{conv.account || "—"}</span>
                   <span>Location</span>
-                  <span>{conv.region || "—"}</span>
+                  <span>{profileCityState || "—"}</span>
                   <span>Language</span>
-                  <span>{conv.language || summary?.language || "—"}</span>
+                  <span>{profileLanguage}</span>
                   <span>Dealer</span>
-                  <span>
+                  <span className={conv.dealer ? "wa-dealer-linked-cell" : undefined}>
                     {conv.dealer ? (
-                      <Link className="wa-inline-link" to={`/dealers?q=${encodeURIComponent(conv.dealer.phone || conv.dealer.name)}`}>
-                        {conv.dealer.name || conv.dealer.company || "View dealer"}
-                      </Link>
+                      <span className="wa-dealer-linked-row">
+                        <Link
+                          className="wa-inline-link"
+                          to={`/dealers?q=${encodeURIComponent(conv.dealer.phone || conv.dealer.name)}`}
+                          title={conv.dealer.name || conv.dealer.company}
+                        >
+                          {conv.dealer.name || conv.dealer.company || "View dealer"}
+                        </Link>
+                        <button
+                          type="button"
+                          className="wa-text-btn wa-delink-btn"
+                          disabled={delinkingDealer}
+                          onClick={() => delinkDealer().catch(() => null)}
+                        >
+                          {delinkingDealer ? "Delinking…" : "Delink"}
+                        </button>
+                      </span>
                     ) : (
                       <button type="button" className="wa-text-btn" onClick={openLinkDealer}>
                         Link Dealer
@@ -442,52 +538,6 @@ export default function RightPanel(props: Props) {
               </div>
             </section>
 
-            {dealerSearchOpen ? (
-              <section className="wa-card wa-dealer-box">
-                <div className="wa-card-head">
-                  <h4>Link dealer</h4>
-                  <button type="button" className="wa-text-btn" onClick={() => setDealerSearchOpen(false)}>Close</button>
-                </div>
-                <div className="wa-search wa-search-inset">
-                  <input
-                    value={dealerQ}
-                    onChange={(e) => setDealerQ(e.target.value)}
-                    placeholder="Search dealers by name, phone, code"
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        searchDealers(dealerQ).catch(() => null);
-                      }
-                    }}
-                  />
-                </div>
-                <div className="wa-pactions">
-                  <button type="button" className="btn" disabled={dealerSearching} onClick={() => searchDealers(dealerQ)}>
-                    {dealerSearching ? "Searching…" : "Search"}
-                  </button>
-                  <button type="button" className="btn primary" disabled={!selectedDealerId || linkingDealer} onClick={() => linkSelectedDealer()}>
-                    {linkingDealer ? "Linking…" : "Link dealer"}
-                  </button>
-                </div>
-                <div className="wa-dealer-hits">
-                  {!dealerHits.length && !dealerSearching ? (
-                    <div className="wa-hint">No matches yet — try name or last 10 digits.</div>
-                  ) : null}
-                  {dealerHits.map((d) => (
-                    <button
-                      key={d.id}
-                      type="button"
-                      className={`wa-dealer-hit ${selectedDealerId === d.id ? "on" : ""}`}
-                      onClick={() => setSelectedDealerId(d.id)}
-                    >
-                      <b>{d.name || d.company || `Dealer #${d.id}`}</b>
-                      <span>{d.phone || "—"}{d.company ? ` · ${d.company}` : ""}</span>
-                    </button>
-                  ))}
-                </div>
-              </section>
-            ) : null}
-
             <AiSummaryCard
               summary={summary}
               loading={outlineLoading}
@@ -495,6 +545,15 @@ export default function RightPanel(props: Props) {
               stale={outlineStale}
               generatedAt={outlineAt}
               onRegenerate={onRegenerate}
+            />
+
+            <AiReplyAssistant
+              conversationId={conv?.id || null}
+              onToast={onToast}
+              onUseReply={(text) => {
+                onUseAiReply?.(text);
+                onToast("Reply copied to composer — review before send");
+              }}
             />
 
             <section className="wa-card">
@@ -532,6 +591,11 @@ export default function RightPanel(props: Props) {
                 >
                   <UserCogIcon size={15} /> Assign Owner
                 </button>
+                {onMarkSpam ? (
+                  <button type="button" className="wa-qa wa-qa-spam" onClick={onMarkSpam}>
+                    Mark as Spam
+                  </button>
+                ) : null}
               </div>
             </section>
 
@@ -618,10 +682,20 @@ export default function RightPanel(props: Props) {
               <div className="wa-related-block">
                 <h5>Linked Dealer</h5>
                 {related?.dealer || conv.dealer ? (
-                  <Link className="wa-related-row" to={`/dealers?q=${encodeURIComponent((related?.dealer || conv.dealer)?.phone || "")}`}>
-                    <b>{(related?.dealer || conv.dealer)?.name || "Dealer"}</b>
-                    <span>{(related?.dealer || conv.dealer)?.phone}</span>
-                  </Link>
+                  <>
+                    <Link className="wa-related-row" to={`/dealers?q=${encodeURIComponent((related?.dealer || conv.dealer)?.phone || "")}`}>
+                      <b>{(related?.dealer || conv.dealer)?.name || "Dealer"}</b>
+                      <span>{(related?.dealer || conv.dealer)?.phone}</span>
+                    </Link>
+                    <button
+                      type="button"
+                      className="wa-text-btn wa-delink-btn"
+                      disabled={delinkingDealer}
+                      onClick={() => delinkDealer().catch(() => null)}
+                    >
+                      {delinkingDealer ? "Delinking…" : "Delink dealer"}
+                    </button>
+                  </>
                 ) : (
                   <button type="button" className="wa-text-btn" onClick={openLinkDealer}>Link Dealer</button>
                 )}
@@ -657,6 +731,73 @@ export default function RightPanel(props: Props) {
           </section>
         )}
       </div>
+
+      {dealerSearchOpen && conv ? (
+        <div
+          className="wa-assign-modal wa-dealer-link-modal"
+          onClick={(e) => { if (e.target === e.currentTarget) closeLinkDealer(); }}
+        >
+          <div className="wa-assign-panel wa-dealer-link-panel" role="dialog" aria-label="Link dealer">
+            <div className="wa-card-head">
+              <h4>Link dealer</h4>
+              <button type="button" className="wa-text-btn" onClick={() => closeLinkDealer()}>Close</button>
+            </div>
+            <p className="wa-hint wa-dealer-link-hint">Type name, phone, or Zoho code — picks update as you type.</p>
+            <div className="wa-search wa-search-inset">
+              <input
+                ref={dealerSearchRef}
+                value={dealerQ}
+                onChange={(e) => {
+                  setDealerQ(e.target.value);
+                  setSelectedDealerId(null);
+                }}
+                placeholder="e.g. Global Digital, 98470…, dealer code"
+                autoComplete="off"
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") {
+                    e.preventDefault();
+                    closeLinkDealer();
+                  }
+                }}
+              />
+            </div>
+            <div className="wa-dealer-hits wa-dealer-link-hits">
+              {dealerSearching ? <div className="wa-hint">Searching…</div> : null}
+              {!dealerSearching && dealerQ.trim().length < 2 ? (
+                <div className="wa-hint">Enter at least 2 characters to search.</div>
+              ) : null}
+              {!dealerSearching && dealerQ.trim().length >= 2 && !dealerHits.length ? (
+                <div className="wa-hint">No similar dealers — try another spelling or last 10 digits.</div>
+              ) : null}
+              {dealerHits.map((d) => (
+                <button
+                  key={d.id}
+                  type="button"
+                  className={`wa-dealer-hit ${selectedDealerId === d.id ? "on" : ""}`}
+                  onClick={() => setSelectedDealerId(d.id)}
+                  onDoubleClick={() => linkSelectedDealer().catch(() => null)}
+                >
+                  <b>{d.name || d.company || `Dealer #${d.id}`}</b>
+                  <span>
+                    {[d.phone, d.code, d.city, d.state].filter(Boolean).join(" · ") || "—"}
+                  </span>
+                </button>
+              ))}
+            </div>
+            <div className="wa-pactions">
+              <button type="button" className="btn" onClick={() => closeLinkDealer()}>Cancel</button>
+              <button
+                type="button"
+                className="btn primary"
+                disabled={!selectedDealerId || linkingDealer}
+                onClick={() => linkSelectedDealer()}
+              >
+                {linkingDealer ? "Linking…" : "Link selected dealer"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {assignOpen && conv ? (
         <div className="wa-assign-modal" onClick={(e) => { if (e.target === e.currentTarget) setAssignOpen(false); }}>

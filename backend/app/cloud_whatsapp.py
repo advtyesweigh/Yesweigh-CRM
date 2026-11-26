@@ -38,9 +38,10 @@ from app.models import User, WhatsAppConversation, WhatsAppInstance, WhatsAppMes
 from app.sync_firebase_catalog import (
     DEFAULT_API_KEY,
     DEFAULT_PROJECT,
+    FirebaseAuthError,
     auth_email_from_login,
     decode_doc,
-    sign_in,
+    get_firebase_id_token,
 )
 
 router = APIRouter(tags=["cloud-whatsapp"])
@@ -495,6 +496,26 @@ async def upsert_care_conversation(
     return conv
 
 
+def _schedule_care_voice_or_text_ai(msg: WhatsAppMessage, *, preset_transcript: str = "") -> None:
+    """Queue Sarvam STT (local voice) or text→Malayalam after Care ingest (matches Evolution)."""
+    if (preset_transcript or msg.transcript or "").strip():
+        return
+    try:
+        from app.sarvam_transcribe import (
+            is_speech_media_type,
+            is_text_translatable_message,
+            schedule_text_translation,
+            schedule_transcription,
+        )
+
+        if is_speech_media_type(msg.media_type) and is_local_media_url(msg.media_url or ""):
+            schedule_transcription(msg.id)
+        elif is_text_translatable_message(msg):
+            schedule_text_translation(msg.id)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def upsert_care_message(
     db: AsyncSession,
     inst: WhatsAppInstance,
@@ -583,6 +604,7 @@ async def upsert_care_message(
             existing.status = st
         if created_at and existing.created_at and created_at < existing.created_at:
             existing.created_at = created_at
+        _schedule_care_voice_or_text_ai(existing, preset_transcript=transcript)
         return existing, content_changed
 
     msg = WhatsAppMessage(
@@ -603,6 +625,7 @@ async def upsert_care_message(
     )
     db.add(msg)
     await db.flush()
+    _schedule_care_voice_or_text_ai(msg, preset_transcript=transcript)
     # New message rows always change the outline fingerprint (count / last id).
     return msg, True
 
@@ -672,7 +695,10 @@ async def _firebase_id_token(client: httpx.AsyncClient, settings) -> tuple[str, 
     api_key = (settings.firebase_api_key or DEFAULT_API_KEY).strip() or DEFAULT_API_KEY
     project = (settings.firebase_project_id or DEFAULT_PROJECT).strip() or DEFAULT_PROJECT
     email = _firebase_email(settings)
-    token = await sign_in(client, api_key, email, password)
+    try:
+        token = await get_firebase_id_token(client, api_key, email, password)
+    except FirebaseAuthError as exc:
+        raise HTTPException(503, str(exc)) from exc
     return token, project
 
 
@@ -701,18 +727,257 @@ async def _run_query(
     return rows
 
 
+async def _fetch_firestore_care_conv(
+    client: httpx.AsyncClient,
+    *,
+    project: str,
+    id_token: str,
+    wa_id: str,
+) -> dict[str, Any] | None:
+    """Load one YesOne whatsappConversations row by waId (not top-N list)."""
+    for needle in (wa_id, wa_id.lstrip("91") if wa_id.startswith("91") and len(wa_id) > 10 else ""):
+        if not needle:
+            continue
+        rows = await _run_query(
+            client,
+            project=project,
+            id_token=id_token,
+            structured_query={
+                "from": [{"collectionId": "whatsappConversations"}],
+                "where": {
+                    "fieldFilter": {
+                        "field": {"fieldPath": "waId"},
+                        "op": "EQUAL",
+                        "value": {"stringValue": needle},
+                    }
+                },
+                "limit": 1,
+            },
+        )
+        if rows:
+            return rows[0]
+    return None
+
+
+async def _ingest_firestore_care_messages(
+    client: httpx.AsyncClient,
+    *,
+    project: str,
+    id_token: str,
+    db: AsyncSession,
+    inst: WhatsAppInstance,
+    conv: WhatsAppConversation,
+    wa_id: str,
+    msg_limit: int,
+) -> int:
+    msg_docs = await _run_query(
+        client,
+        project=project,
+        id_token=id_token,
+        structured_query={
+            "from": [{"collectionId": "whatsappMessages"}],
+            "where": {
+                "fieldFilter": {
+                    "field": {"fieldPath": "waId"},
+                    "op": "EQUAL",
+                    "value": {"stringValue": wa_id},
+                }
+            },
+            "orderBy": [{"field": {"fieldPath": "createdAt"}, "direction": "ASCENDING"}],
+            "limit": max(1, min(int(msg_limit), 500)),
+        },
+    )
+    if not msg_docs:
+        alt = wa_id.lstrip("91") if wa_id.startswith("91") and len(wa_id) > 10 else ""
+        if alt and alt != wa_id:
+            msg_docs = await _run_query(
+                client,
+                project=project,
+                id_token=id_token,
+                structured_query={
+                    "from": [{"collectionId": "whatsappMessages"}],
+                    "where": {
+                        "fieldFilter": {
+                            "field": {"fieldPath": "waId"},
+                            "op": "EQUAL",
+                            "value": {"stringValue": alt},
+                        }
+                    },
+                    "orderBy": [{"field": {"fieldPath": "createdAt"}, "direction": "ASCENDING"}],
+                    "limit": max(1, min(int(msg_limit), 500)),
+                },
+            )
+    latest_preview = ""
+    latest_type = ""
+    latest_at = conv.last_message_at
+    count = 0
+    for m in msg_docs:
+        ext = str(m.get("whatsappMessageId") or m.get("_id") or "").strip()
+        created = _parse_firestore_time(m.get("createdAt"))
+        text = str(m.get("text") or "")
+        translated = str(m.get("translatedText") or "").strip()
+        transcript = str(m.get("transcript") or m.get("malayalamText") or "").strip()
+        display_text = translated or text
+        msg_type = str(m.get("type") or "text")
+        raw_media_url = str(m.get("mediaUrl") or m.get("translatedMediaUrl") or "")
+        raw_media_name = str(m.get("fileName") or "")
+        raw_mime = str(m.get("mimeType") or "")
+        media_url, media_name = await resolve_care_media_for_ingest(
+            msg_type=msg_type,
+            media_url=raw_media_url,
+            media_name=raw_media_name,
+            mime_type=raw_mime,
+        )
+        await upsert_care_message(
+            db,
+            inst,
+            conv,
+            external_id=ext,
+            direction=str(m.get("direction") or "inbound"),
+            msg_type=msg_type,
+            text=display_text,
+            status=str(m.get("status") or ""),
+            media_url=media_url,
+            media_name=media_name,
+            mime_type=raw_mime,
+            sender_name=str(m.get("senderName") or m.get("sentByName") or ""),
+            created_at=created,
+            transcript=transcript,
+        )
+        count += 1
+        if created and (not latest_at or created >= latest_at):
+            latest_at = created
+            latest_preview = display_text
+            latest_type = msg_type
+    if latest_preview or latest_type:
+        preview = cloud_preview_label(latest_type, latest_preview)
+        if preview:
+            conv.last_message_preview = preview[:255]
+        if latest_at:
+            conv.last_message_at = latest_at
+    return count
+
+
+async def _upsert_care_conv_from_firestore_doc(
+    db: AsyncSession,
+    inst: WhatsAppInstance,
+    doc: dict[str, Any],
+) -> tuple[WhatsAppConversation | None, str]:
+    wa_id = _phone_digits(str(doc.get("waId") or doc.get("_id") or ""))
+    if not wa_id:
+        return None, ""
+    last_at = _parse_firestore_time(doc.get("lastAt") or doc.get("lastInboundAt") or doc.get("updatedAt"))
+    conv = await upsert_care_conversation(
+        db,
+        inst,
+        wa_id=wa_id,
+        sender_name=str(doc.get("senderName") or doc.get("softwareShopName") or ""),
+        last_text=str(doc.get("lastText") or ""),
+        last_type=str(doc.get("lastType") or ""),
+        last_at=last_at,
+        unread_count=int(doc.get("unreadCount") or 0),
+        closed=bool(doc.get("closed")),
+        channel_phone=str(doc.get("channelPhoneNumber") or ""),
+        profile_image=str(doc.get("profileImage") or ""),
+    )
+    return conv, wa_id
+
+
+async def _sync_one_care_wa_from_firestore(
+    client: httpx.AsyncClient,
+    *,
+    project: str,
+    id_token: str,
+    db: AsyncSession,
+    inst: WhatsAppInstance,
+    target_wa: str,
+    msg_limit: int,
+) -> tuple[int, int]:
+    doc = await _fetch_firestore_care_conv(client, project=project, id_token=id_token, wa_id=target_wa)
+    if doc:
+        conv, wa_id = await _upsert_care_conv_from_firestore_doc(db, inst, doc)
+    else:
+        conv = await upsert_care_conversation(db, inst, wa_id=target_wa)
+        wa_id = target_wa
+    if not conv:
+        return 0, 0
+    msgs = await _ingest_firestore_care_messages(
+        client,
+        project=project,
+        id_token=id_token,
+        db=db,
+        inst=inst,
+        conv=conv,
+        wa_id=wa_id,
+        msg_limit=msg_limit,
+    )
+    return 1, msgs
+
+
+async def sync_care_wa_ids_from_firestore(
+    db: AsyncSession,
+    wa_ids: list[str],
+    *,
+    message_limit: int | None = None,
+) -> dict[str, Any]:
+    """Import several Care chats using one Firebase Auth session."""
+    settings = get_settings()
+    inst = await require_care_instance(db)
+    msg_limit = message_limit or settings.care_sync_message_limit
+    conversations_upserted = 0
+    messages_upserted = 0
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        id_token, project = await _firebase_id_token(client, settings)
+        for raw in wa_ids:
+            target_wa = _phone_digits(raw)
+            if not target_wa:
+                continue
+            c_inc, m_inc = await _sync_one_care_wa_from_firestore(
+                client,
+                project=project,
+                id_token=id_token,
+                db=db,
+                inst=inst,
+                target_wa=target_wa,
+                msg_limit=msg_limit,
+            )
+            conversations_upserted += c_inc
+            messages_upserted += m_inc
+
+        inst.history_sync_status = "ok"
+        inst.history_sync_at = datetime.now(timezone.utc)
+        inst.history_sync_stats = (
+            f'{{"conversations":{conversations_upserted},"messages":{messages_upserted}}}'
+        )
+        inst.history_sync_error = ""
+        if inst.connection_status != "Connected":
+            inst.connection_status = "Connected"
+        await db.commit()
+    return {
+        "ok": True,
+        "instance_id": inst.public_id,
+        "conversations": conversations_upserted,
+        "messages": messages_upserted,
+        "connection_status": inst.connection_status,
+        "connected_phone_number": inst.connected_phone_number,
+    }
+
+
 async def sync_care_from_firestore(
     db: AsyncSession,
     *,
     conversation_limit: int | None = None,
     message_wa_id: str | None = None,
     message_limit: int | None = None,
+    pull_all_messages: bool = False,
 ) -> dict[str, Any]:
     """Backfill Care chats from YesOne Firestore (catalog-sync style Auth)."""
     settings = get_settings()
     inst = await require_care_instance(db)
     conv_limit = conversation_limit or settings.care_sync_conversation_limit
     msg_limit = message_limit or settings.care_sync_message_limit
+    msg_conv_cap = max(1, min(int(settings.care_sync_message_conversation_cap), 300))
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         id_token, project = await _firebase_id_token(client, settings)
@@ -736,111 +1001,54 @@ async def sync_care_from_firestore(
         except Exception:  # noqa: BLE001
             pass
 
-        conv_docs = await _run_query(
-            client,
-            project=project,
-            id_token=id_token,
-            structured_query={
-                "from": [{"collectionId": "whatsappConversations"}],
-                "orderBy": [{"field": {"fieldPath": "lastAt"}, "direction": "DESCENDING"}],
-                "limit": max(1, min(int(conv_limit), 300)),
-            },
-        )
-
         conversations_upserted = 0
         messages_upserted = 0
         target_wa = _phone_digits(message_wa_id or "") if message_wa_id else ""
 
-        for doc in conv_docs:
-            wa_id = _phone_digits(str(doc.get("waId") or doc.get("_id") or ""))
-            if not wa_id:
-                continue
-            if target_wa and wa_id != target_wa:
-                continue
-            last_at = _parse_firestore_time(doc.get("lastAt") or doc.get("lastInboundAt") or doc.get("updatedAt"))
-            conv = await upsert_care_conversation(
-                db,
-                inst,
-                wa_id=wa_id,
-                sender_name=str(doc.get("senderName") or doc.get("softwareShopName") or ""),
-                last_text=str(doc.get("lastText") or ""),
-                last_type=str(doc.get("lastType") or ""),
-                last_at=last_at,
-                unread_count=int(doc.get("unreadCount") or 0),
-                closed=bool(doc.get("closed")),
-                channel_phone=str(doc.get("channelPhoneNumber") or ""),
-                profile_image=str(doc.get("profileImage") or ""),
+        if target_wa:
+            c_inc, m_inc = await _sync_one_care_wa_from_firestore(
+                client,
+                project=project,
+                id_token=id_token,
+                db=db,
+                inst=inst,
+                target_wa=target_wa,
+                msg_limit=msg_limit,
             )
-            conversations_upserted += 1
-
-            pull_messages = bool(target_wa) or conversations_upserted <= 40
-            if not pull_messages:
-                continue
-
-            msg_docs = await _run_query(
+            conversations_upserted += c_inc
+            messages_upserted += m_inc
+        else:
+            conv_docs = await _run_query(
                 client,
                 project=project,
                 id_token=id_token,
                 structured_query={
-                    "from": [{"collectionId": "whatsappMessages"}],
-                    "where": {
-                        "fieldFilter": {
-                            "field": {"fieldPath": "waId"},
-                            "op": "EQUAL",
-                            "value": {"stringValue": wa_id},
-                        }
-                    },
-                    "orderBy": [{"field": {"fieldPath": "createdAt"}, "direction": "ASCENDING"}],
-                    "limit": max(1, min(int(msg_limit), 500)),
+                    "from": [{"collectionId": "whatsappConversations"}],
+                    "orderBy": [{"field": {"fieldPath": "lastAt"}, "direction": "DESCENDING"}],
+                    "limit": max(1, min(int(conv_limit), 300)),
                 },
             )
-            latest_preview = ""
-            latest_type = ""
-            latest_at = conv.last_message_at
-            for m in msg_docs:
-                ext = str(m.get("whatsappMessageId") or m.get("_id") or "").strip()
-                created = _parse_firestore_time(m.get("createdAt"))
-                text = str(m.get("text") or "")
-                translated = str(m.get("translatedText") or "").strip()
-                transcript = str(m.get("transcript") or m.get("malayalamText") or "").strip()
-                display_text = translated or text
-                msg_type = str(m.get("type") or "text")
-                raw_media_url = str(m.get("mediaUrl") or m.get("translatedMediaUrl") or "")
-                raw_media_name = str(m.get("fileName") or "")
-                raw_mime = str(m.get("mimeType") or "")
-                media_url, media_name = await resolve_care_media_for_ingest(
-                    msg_type=msg_type,
-                    media_url=raw_media_url,
-                    media_name=raw_media_name,
-                    mime_type=raw_mime,
+
+            for doc in conv_docs:
+                conv, wa_id = await _upsert_care_conv_from_firestore_doc(db, inst, doc)
+                if not conv or not wa_id:
+                    continue
+                conversations_upserted += 1
+
+                pull_messages = pull_all_messages or conversations_upserted <= msg_conv_cap
+                if not pull_messages:
+                    continue
+
+                messages_upserted += await _ingest_firestore_care_messages(
+                    client,
+                    project=project,
+                    id_token=id_token,
+                    db=db,
+                    inst=inst,
+                    conv=conv,
+                    wa_id=wa_id,
+                    msg_limit=msg_limit,
                 )
-                await upsert_care_message(
-                    db,
-                    inst,
-                    conv,
-                    external_id=ext,
-                    direction=str(m.get("direction") or "inbound"),
-                    msg_type=msg_type,
-                    text=display_text,
-                    status=str(m.get("status") or ""),
-                    media_url=media_url,
-                    media_name=media_name,
-                    mime_type=raw_mime,
-                    sender_name=str(m.get("senderName") or m.get("sentByName") or ""),
-                    created_at=created,
-                    transcript=transcript,
-                )
-                messages_upserted += 1
-                if created and (not latest_at or created >= latest_at):
-                    latest_at = created
-                    latest_preview = display_text
-                    latest_type = msg_type
-            if latest_preview or latest_type:
-                preview = cloud_preview_label(latest_type, latest_preview)
-                if preview:
-                    conv.last_message_preview = preview[:255]
-                if latest_at:
-                    conv.last_message_at = latest_at
 
         inst.history_sync_status = "ok"
         inst.history_sync_at = datetime.now(timezone.utc)
@@ -866,11 +1074,16 @@ async def care_sync(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
     wa_id: str = Query("", description="Optional single chat waId to sync deeply"),
+    all_messages: bool = Query(False, description="Pull message bodies for every conversation in this batch"),
 ):
     """Pull Care conversations/messages from YesOne Firestore into CRM."""
     _ = user
     try:
-        return await sync_care_from_firestore(db, message_wa_id=wa_id or None)
+        return await sync_care_from_firestore(
+            db,
+            message_wa_id=wa_id or None,
+            pull_all_messages=all_messages,
+        )
     except HTTPException:
         raise
     except SystemExit as exc:
@@ -892,6 +1105,7 @@ async def cloud_whatsapp_webhook(
     inst = await require_care_instance(db)
     conv_by_wa: dict[str, WhatsAppConversation] = {}
     outline_conv_ids: set[int] = set()
+    new_messenger_msg_ids: list[int] = []
     for c in body.conversations:
         wa = _phone_digits(c.wa_id)
         if not wa:
@@ -957,14 +1171,46 @@ async def cloud_whatsapp_webhook(
         created = _parse_firestore_time(m.created_at)
         if created:
             conv.last_message_at = created
-        if str(m.direction).lower() in {"in", "inbound", "incoming"}:
-            conv.unread_count = int(conv.unread_count or 0) + 1
+        inbound = str(m.direction).lower() in {"in", "inbound", "incoming"}
+        if inbound:
+            if not getattr(conv, "is_spam", False):
+                conv.unread_count = int(conv.unread_count or 0) + 1
             if conv.status == "Resolved":
                 conv.status = "Open"
+        from app.whatsapp_reply_latency import complete_staff_reply
+        from app.whatsapp_reply_needed import apply_inbound_reply_state
+
+        if inbound:
+            await apply_inbound_reply_state(db, conv, inbound_text=m.text or "")
+            if _msg and getattr(_msg, "id", None):
+                new_messenger_msg_ids.append(int(_msg.id))
+        else:
+            await complete_staff_reply(
+                db,
+                conv,
+                replied_at=created,
+                source="care_cloud",
+                inst=inst,
+                msg=_msg,
+            )
     inst.connection_status = "Connected"
     await db.commit()
     if outline_conv_ids:
         schedule_outline_refresh(outline_conv_ids)
+        try:
+            from app.intel.jobs import schedule_thread_intel
+
+            schedule_thread_intel(*outline_conv_ids)
+        except Exception as exc:  # noqa: BLE001
+            print(f"intel enqueue skipped: {exc}")
+    if new_messenger_msg_ids:
+        try:
+            from app.whatsapp_new_messenger import schedule_new_messenger
+
+            for mid in new_messenger_msg_ids:
+                schedule_new_messenger(message_id=int(mid))
+        except Exception as exc:  # noqa: BLE001
+            print(f"new_messenger schedule skipped: {exc}")
     return {"ok": True, "conversations": len(body.conversations), "messages": len(body.messages)}
 
 
@@ -1376,6 +1622,7 @@ async def meta_whatsapp_webhook(
     inst = await require_care_instance(db)
     conv_by_wa: dict[str, WhatsAppConversation] = {}
     outline_conv_ids: set[int] = set()
+    new_messenger_msg_ids: list[int] = []
     for c in normalized.conversations:
         wa = _phone_digits(c.wa_id)
         if not wa:
@@ -1441,14 +1688,46 @@ async def meta_whatsapp_webhook(
         created = _parse_firestore_time(m.created_at)
         if created:
             conv.last_message_at = created
-        if str(m.direction).lower() in {"in", "inbound", "incoming"}:
-            conv.unread_count = int(conv.unread_count or 0) + 1
+        inbound = str(m.direction).lower() in {"in", "inbound", "incoming"}
+        if inbound:
+            if not getattr(conv, "is_spam", False):
+                conv.unread_count = int(conv.unread_count or 0) + 1
             if conv.status == "Resolved":
                 conv.status = "Open"
+        from app.whatsapp_reply_latency import complete_staff_reply
+        from app.whatsapp_reply_needed import apply_inbound_reply_state
+
+        if inbound:
+            await apply_inbound_reply_state(db, conv, inbound_text=m.text or "")
+            if _msg and getattr(_msg, "id", None):
+                new_messenger_msg_ids.append(int(_msg.id))
+        else:
+            await complete_staff_reply(
+                db,
+                conv,
+                replied_at=created,
+                source="care_cloud",
+                inst=inst,
+                msg=_msg,
+            )
     inst.connection_status = "Connected"
     await db.commit()
     if outline_conv_ids:
         schedule_outline_refresh(outline_conv_ids)
+        try:
+            from app.intel.jobs import schedule_thread_intel
+
+            schedule_thread_intel(*outline_conv_ids)
+        except Exception as exc:  # noqa: BLE001
+            print(f"intel enqueue skipped: {exc}")
+    if new_messenger_msg_ids:
+        try:
+            from app.whatsapp_new_messenger import schedule_new_messenger
+
+            for mid in new_messenger_msg_ids:
+                schedule_new_messenger(message_id=int(mid))
+        except Exception as exc:  # noqa: BLE001
+            print(f"new_messenger schedule skipped: {exc}")
     return {
         "ok": True,
         "forwarded": True,

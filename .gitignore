@@ -17,3 +17,10 @@ frontend/android/
 frontend/ios/
 frontend/.capacitor/
 sales_products.py.bak-agent
+
+# Android build artifacts
+android/yes-crm/.gradle/
+android/yes-crm/app/build/
+android/yes-crm/.idea/
+*.apk
+*.aab

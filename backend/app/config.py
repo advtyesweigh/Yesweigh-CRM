@@ -26,7 +26,8 @@ class Settings(BaseSettings):
     adms_shift_start: str = "09:30"
     adms_shift_end: str = "17:30"
     cors_origins: str = "*"
-    access_token_expire_minutes: int = 60 * 24 * 7
+    # Persistent login: ~6 months (no short idle timeout). New login still revokes prior session.
+    access_token_expire_minutes: int = 60 * 24 * 180
     public_base_url: str = "https://crm.yesweigh.in"
     # Zoho Books OAuth (India DC defaults). Leave blank until secrets are set on the VPS.
     zoho_client_id: str = ""
@@ -63,9 +64,11 @@ class Settings(BaseSettings):
     # Cursor factory poll budget (keep short — builtins cover product×dealer sales).
     ai_tool_factory_timeout_s: float = 90.0
     # Hard cap for one AI command (Gemini + tools + optional factory).
-    ai_run_timeout_s: float = 180.0
+    # Must cover send_whatsapp_text_batch: up to 50 recipients × ~10s delay + model rounds.
+    ai_run_timeout_s: float = 900.0
     # Mark abandoned "running" rows failed (API restart / cancelled background task).
-    ai_run_stale_s: float = 600.0
+    # Keep above ai_run_timeout_s so in-flight batch sends are not marked stale early.
+    ai_run_stale_s: float = 1200.0
     # Host/volume path for generated tool modules (survives image rebuilds).
     ai_generated_tools_dir: str = "/data/ai-generated-tools"
     # Rough Gemini Flash-Lite list pricing (USD / 1M tokens) for INR estimates.
@@ -100,6 +103,8 @@ class Settings(BaseSettings):
     )
     care_sync_conversation_limit: int = 120
     care_sync_message_limit: int = 200
+    # Bulk Care Firestore sync: pull messages for this many recent conversations (max 300).
+    care_sync_message_conversation_cap: int = 300
 
 
 @lru_cache

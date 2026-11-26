@@ -277,7 +277,9 @@ async def enrich(
         async with httpx.AsyncClient(timeout=30.0) as client:
             for lead in leads:
                 stats.scanned += 1
-                state = (lead.state or "Kerala").strip() or "Kerala"
+                from app.state_normalize import canon_state
+
+                state = canon_state((lead.state or "Keralam").strip() or "Keralam")
                 query = f"{lead.name} {lead.district} {state} India"
                 try:
                     places = await search_place(client, api_key, query)
@@ -335,10 +337,8 @@ async def enrich(
                     lead.city = city
                     changed = True
 
-                note = places_note(addr)
-                if note and note not in (lead.notes or ""):
-                    existing = (lead.notes or "").strip()
-                    lead.notes = f"{existing}\n{note}".strip() if existing else note
+                if addr and not (lead.address or "").strip():
+                    lead.address = addr
                     changed = True
 
                 sample = (

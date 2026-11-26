@@ -12,6 +12,23 @@ export function clearToken() {
   localStorage.removeItem("crm_token");
 }
 
+/** Same-origin media path for `<img>` / `<video>` (session cookie auth). Does not download into a blob. */
+export function mediaAssetUrl(path: string): string {
+  if (!path) return "";
+  if (/^https?:\/\//i.test(path)) return path;
+  const base = API_BASE.replace(/\/$/, "");
+  const p = path.startsWith("/") ? path : `/${path}`;
+  return `${base}${p}`;
+}
+
+function redirectToLogin() {
+  clearToken();
+  if (typeof window === "undefined") return;
+  const path = window.location.pathname || "";
+  if (path === "/login" || path.startsWith("/login/")) return;
+  window.location.assign("/login");
+}
+
 /** Turn API / gateway error bodies into a short toast-safe message. Never returns HTML. */
 export function formatApiError(status: number, body: string, fallback = "Request failed"): string {
   const text = (body || "").trim();
@@ -24,6 +41,7 @@ export function formatApiError(status: number, body: string, fallback = "Request
     /nginx\//i.test(text);
 
   if (looksHtml || !text) {
+    if (status === 413) return "File too large for server upload limit";
     if (status === 502) return "Server unavailable (502)";
     if (status === 503) return "Server unavailable (503)";
     if (status === 504) return "Server timeout (504)";
@@ -68,9 +86,12 @@ export async function api<T>(path: string, opts: RequestInit = {}): Promise<T> {
   }
   const token = getToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
-  const res = await fetch(`${API_BASE}${path}`, { ...opts, headers });
+  const res = await fetch(`${API_BASE}${path}`, { ...opts, headers, credentials: "include" });
   if (!res.ok) {
     const text = await res.text();
+    if (res.status === 401) {
+      redirectToLogin();
+    }
     throw new Error(formatApiError(res.status, text, res.statusText || "Request failed"));
   }
   if (res.status === 204) return undefined as T;
@@ -108,10 +129,28 @@ export async function login(email: string, password: string) {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body,
+    credentials: "include",
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(formatApiError(res.status, text, "Login failed"));
   }
   return res.json();
+}
+
+export async function logout(): Promise<void> {
+  try {
+    const headers = new Headers();
+    const token = getToken();
+    if (token) headers.set("Authorization", `Bearer ${token}`);
+    await fetch(`${API_BASE}/api/auth/logout`, {
+      method: "POST",
+      headers,
+      credentials: "include",
+    });
+  } catch {
+    /* still clear local session */
+  } finally {
+    clearToken();
+  }
 }

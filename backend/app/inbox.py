@@ -1,6 +1,7 @@
 """Multi-agent WhatsApp Inbox APIs — YesWeigh org instances only."""
 from __future__ import annotations
 
+import asyncio
 import base64
 import re
 import uuid
@@ -10,7 +11,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -27,8 +28,9 @@ from app.evolution import (
     primary_owner_employee,
 )
 from app.media_store import PUBLIC_PREFIX, resolve_path, save_bytes, save_data_url, to_evolution_base64
-from app.dealers import _normalized_phone_sql
+from app.dealers import _normalized_phone_sql, dealer_lifetime_sales_map
 from app.models import (
+    CampaignRun,
     Dealer,
     Employee,
     Lead,
@@ -40,9 +42,15 @@ from app.models import (
     WorkItem,
     ZohoDealer,
 )
-from app.phone_util import normalize_in_mobile
+from app.phone_util import normalize_in_mobile, to_evolution_number
 from app.whatsapp_chat_meta import chat_kind_from_jid, enrich_conversation_meta
-from app.whatsapp_chat_types import newsletter_list_filter
+from app.whatsapp_chat_types import dm_inbox_filter, newsletter_list_filter
+from app.whatsapp_service_meta import (
+    enrich_conversation_rows,
+    hold_since_map,
+    parse_cached_outline_summary,
+    resolve_service_fields,
+)
 
 router = APIRouter(tags=["whatsapp-inbox"])
 Db = Annotated[AsyncSession, Depends(get_db)]
@@ -156,14 +164,24 @@ def _is_admin(user: User) -> bool:
     return user.role.lower() in {"admin", "super_admin", "super admin", "management"}
 
 
+def _not_spam_filter():
+    """Hide soft-spam conversations from normal inbox lists and badge counts."""
+    return or_(
+        WhatsAppConversation.is_spam.is_(False),
+        WhatsAppConversation.is_spam.is_(None),
+    )
+
+
 def _phone_digits(value: str) -> str:
     return re.sub(r"\D+", "", value or "")
 
 
 def _send_recipient(conv: WhatsAppConversation) -> str:
     """
-    Evolution GO needs a real PN or an explicit @lid jid.
+    Evolution GO needs a real PN (with country code) or an explicit @lid jid.
     Bare LID digits get wrongly treated as @s.whatsapp.net and fail.
+    Indian 10-digit mobiles must be sent as 91XXXXXXXXXX — otherwise Evolution
+    formatJid turns e.g. 7592052528 into +7592052528 (wrong country) and fails.
     """
     jid = (conv.customer_jid or "").strip()
     phone = _phone_digits(conv.customer_phone)
@@ -171,14 +189,19 @@ def _send_recipient(conv: WhatsAppConversation) -> str:
         lid = _phone_digits(jid.split("@")[0])
         # Prefer real phone when we have it and it differs from the LID
         if phone and phone != lid and len(phone) <= 15:
-            return phone
+            return to_evolution_number(phone)
         return f"{lid}@lid" if lid else jid
     if phone:
-        return phone
+        return to_evolution_number(phone)
     if "@" in jid:
+        user = jid.split("@", 1)[0]
+        # Repair bare 10-digit @s.whatsapp.net stored without country code
+        if jid.endswith("@s.whatsapp.net"):
+            fixed = to_evolution_number(user)
+            if fixed and "@" not in fixed:
+                return fixed
         return jid
-    return conv.customer_phone or ""
-
+    return to_evolution_number(conv.customer_phone) or (conv.customer_phone or "")
 
 def _initials(name: str, phone: str = "") -> str:
     parts = [p for p in (name or "").split() if p]
@@ -247,10 +270,10 @@ async def _get_conversation(db: AsyncSession, public_id: str, user: User) -> Wha
     return conv
 
 
-def _dealer_brief(dealer: Dealer | None) -> dict[str, Any] | None:
+def _dealer_brief(dealer: Dealer | None, *, total_sales: float | None = None) -> dict[str, Any] | None:
     if not dealer:
         return None
-    return {
+    out: dict[str, Any] = {
         "id": dealer.id,
         "name": dealer.name or "",
         "company": dealer.company or "",
@@ -259,6 +282,9 @@ def _dealer_brief(dealer: Dealer | None) -> dict[str, Any] | None:
         "city": dealer.city or "",
         "state": dealer.state or "",
     }
+    if total_sales is not None:
+        out["total_sales"] = round(float(total_sales), 2)
+    return out
 
 
 def _conv_out(
@@ -267,11 +293,13 @@ def _conv_out(
     account: str = "",
     agent: str = "",
     dealer: Dealer | None = None,
+    dealer_sales_total: float | None = None,
     provider: str = "",
     last_inbound_at: datetime | None = None,
+    crm_contact_kind: str | None = None,
 ) -> dict[str, Any]:
     name = conv.customer_name or conv.customer_phone
-    linked = _dealer_brief(dealer)
+    linked = _dealer_brief(dealer, total_sales=dealer_sales_total)
     customer_type = conv.customer_type or "Customer"
     if linked and customer_type.lower() != "dealer":
         customer_type = "Dealer"
@@ -303,8 +331,12 @@ def _conv_out(
         "customer_type": customer_type,
         "dealer_id": conv.dealer_id,
         "dealer": linked,
+        "crm_contact_kind": crm_contact_kind,
         "notes_summary": conv.notes_summary,
         "created_at": conv.created_at,
+        "onboarding_step": getattr(conv, "onboarding_step", None) or "",
+        "onboarding_at": getattr(conv, "onboarding_at", None),
+        "onboarding_lead_id": getattr(conv, "onboarding_lead_id", None),
     }
     # Care Meta Cloud only — Evolution personal lines never get Open/Expired.
     if (provider or "").strip().lower() == "meta_cloud":
@@ -349,18 +381,27 @@ async def _conv_out_with_instance(
     agent: str = "",
     dealer: Dealer | None = None,
     inst: WhatsAppInstance | None = None,
+    crm_contact_kind: str | None = None,
 ) -> dict[str, Any]:
     if inst is None:
         inst = await db.get(WhatsAppInstance, conv.whatsapp_instance_id)
     provider = ((getattr(inst, "provider", None) or "evolution") if inst else "").strip().lower()
     last_in = await _last_inbound_at(db, conv.id) if provider == "meta_cloud" else None
+    if crm_contact_kind is None:
+        crm_contact_kind = await _crm_contact_kind(db, conv, dealer=dealer)
+    dealer_sales_total: float | None = None
+    if dealer:
+        sales_map = await dealer_lifetime_sales_map(db, [dealer])
+        dealer_sales_total = sales_map.get(dealer.id)
     return _conv_out(
         conv,
         account=inst.display_name if inst else "",
         agent=agent,
         dealer=dealer,
+        dealer_sales_total=dealer_sales_total,
         provider=provider,
         last_inbound_at=last_in,
+        crm_contact_kind=crm_contact_kind,
     )
 
 
@@ -393,6 +434,114 @@ async def _find_dealer_by_phone(db: AsyncSession, phone: str) -> Dealer | None:
     if zd and zd.dealer_id:
         return await db.get(Dealer, zd.dealer_id)
     return None
+
+
+async def _find_lead_by_phone(db: AsyncSession, phone: str) -> Lead | None:
+    """Match WA number to CRM lead by last-10 digits (leads.phone)."""
+    key = normalize_in_mobile(phone)
+    if not key:
+        return None
+    return (
+        await db.execute(
+            select(Lead).where(_normalized_phone_sql(Lead.phone) == key).order_by(Lead.id.asc()).limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+async def _crm_contact_kind(
+    db: AsyncSession,
+    conv: WhatsAppConversation,
+    *,
+    dealer: Dealer | None = None,
+) -> str | None:
+    """Return 'dealer' | 'lead' for inbox badge, or None if no CRM phone match."""
+    if conv.dealer_id:
+        linked = dealer if dealer and dealer.id == conv.dealer_id else await db.get(Dealer, conv.dealer_id)
+        if linked:
+            return "dealer"
+    if chat_kind_from_jid(conv.customer_jid or "") == "group":
+        return None
+    key = normalize_in_mobile(conv.customer_phone)
+    if not key:
+        return None
+    if await _find_dealer_by_phone(db, conv.customer_phone):
+        return "dealer"
+    if await _find_lead_by_phone(db, conv.customer_phone):
+        return "lead"
+    return None
+
+
+async def _crm_contact_kinds_map(
+    db: AsyncSession,
+    rows: list[WhatsAppConversation],
+    *,
+    dealer_map: dict[int, Dealer],
+) -> dict[int, str]:
+    """Batch resolver for list endpoint — dealer link / phone wins over lead."""
+    kinds: dict[int, str] = {}
+    pending: dict[int, str] = {}
+
+    for conv in rows:
+        if conv.dealer_id and conv.dealer_id in dealer_map:
+            kinds[conv.id] = "dealer"
+            continue
+        if chat_kind_from_jid(conv.customer_jid or "") == "group":
+            continue
+        key = normalize_in_mobile(conv.customer_phone)
+        if key:
+            pending[conv.id] = key
+
+    if not pending:
+        return kinds
+
+    keys = list({k for k in pending.values()})
+    dealer_keys: set[str] = set()
+    for (p10,) in (
+        await db.execute(
+            select(_normalized_phone_sql(Dealer.phone)).where(_normalized_phone_sql(Dealer.phone).in_(keys))
+        )
+    ).all():
+        if p10:
+            dealer_keys.add(str(p10))
+    for phone_p10, mobile_p10 in (
+        await db.execute(
+            select(
+                _normalized_phone_sql(ZohoDealer.phone),
+                _normalized_phone_sql(ZohoDealer.mobile),
+            ).where(
+                ZohoDealer.dealer_id.is_not(None),
+                or_(
+                    _normalized_phone_sql(ZohoDealer.phone).in_(keys),
+                    _normalized_phone_sql(ZohoDealer.mobile).in_(keys),
+                ),
+            )
+        )
+    ).all():
+        for p10 in (phone_p10, mobile_p10):
+            if p10 and str(p10) in keys:
+                dealer_keys.add(str(p10))
+
+    for cid, key in pending.items():
+        if key in dealer_keys:
+            kinds[cid] = "dealer"
+
+    lead_lookup = {k for cid, k in pending.items() if cid not in kinds}
+    if lead_lookup:
+        lead_keys: set[str] = set()
+        for (p10,) in (
+            await db.execute(
+                select(_normalized_phone_sql(Lead.phone)).where(
+                    _normalized_phone_sql(Lead.phone).in_(list(lead_lookup))
+                )
+            )
+        ).all():
+            if p10:
+                lead_keys.add(str(p10))
+        for cid, key in pending.items():
+            if cid not in kinds and key in lead_keys:
+                kinds[cid] = "lead"
+
+    return kinds
 
 
 async def _resolve_conversation_dealer(
@@ -460,6 +609,7 @@ def _msg_out(msg: WhatsAppMessage) -> dict[str, Any]:
         "is_voice": media_type in {"audio", "ptt", "voice"},
         "transcript": getattr(msg, "transcript", None) or "",
         "transcript_language": getattr(msg, "transcript_language", None) or "",
+        "spoken_language": getattr(msg, "spoken_language", None) or "",
         "transcription_status": getattr(msg, "transcription_status", None) or "",
         "transcription_error": getattr(msg, "transcription_error", None) or "",
     }
@@ -493,6 +643,10 @@ class ResolveIn(BaseModel):
     reason: str = ""
 
 
+class MarkSpamIn(BaseModel):
+    confirmed: bool = False
+
+
 class ContactUpdateIn(BaseModel):
     customer_name: str | None = None
     region: str | None = None
@@ -504,8 +658,84 @@ class LinkDealerIn(BaseModel):
     dealer_id: int
 
 
+@router.get("/api/whatsapp/inbox/campaign-reply-filters")
+async def inbox_campaign_reply_filters(db: Db, user: CurrentUser):
+    """Campaign ID pills for Inbox: runs with replies (same replied logic as Report)."""
+    _ = user
+    from app.campaign_reports import list_campaign_reply_filters, refresh_campaign_run_replied_count
+
+    # Light refresh for live / recent runs so badge counts stay useful.
+    live_rows = (
+        await db.execute(
+            select(CampaignRun)
+            .where(CampaignRun.uid.is_not(None))
+            .where(
+                or_(
+                    CampaignRun.status.in_(("running", "queued")),
+                    CampaignRun.replied_count > 0,
+                    CampaignRun.success_count > 0,
+                )
+            )
+            .order_by(CampaignRun.uid.desc())
+            .limit(12)
+        )
+    ).scalars().all()
+    refreshed = 0
+    for run in live_rows:
+        if refreshed >= 6:
+            break
+        try:
+            await refresh_campaign_run_replied_count(db, run)
+            refreshed += 1
+        except Exception:  # noqa: BLE001
+            continue
+    if refreshed:
+        try:
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            try:
+                await db.flush()
+            except Exception:  # noqa: BLE001
+                pass
+
+    items = await list_campaign_reply_filters(db)
+    return {"items": items}
+
+
+@router.get("/api/whatsapp/reply-stats")
+async def whatsapp_reply_stats(
+    db: Db,
+    user: CurrentUser,
+    period: str = Query("7d", pattern="^(today|7d|30d|all)$"),
+):
+    """Average / median staff reply latency for appreciation dashboards."""
+    from app.whatsapp_reply_latency import aggregate_reply_stats
+
+    allowed = await _authorized_instance_ids(db, user)
+    allowed_set = None if allowed is None else set(allowed)
+    return await aggregate_reply_stats(db, period=period, allowed_instance_ids=allowed_set)
+
+
+@router.get("/api/whatsapp/reply-analytics")
+async def whatsapp_reply_analytics(
+    db: Db,
+    user: CurrentUser,
+    period: str = Query("7d", pattern="^(today|7d|30d|all)$"),
+):
+    """Staff performance metrics for Reply stats page (no message bodies / AI chat logs)."""
+    from app.whatsapp_reply_analytics import aggregate_reply_analytics
+
+    allowed = await _authorized_instance_ids(db, user)
+    allowed_set = None if allowed is None else set(allowed)
+    return await aggregate_reply_analytics(db, period=period, allowed_instance_ids=allowed_set)
+
+
 @router.get("/api/whatsapp/inbox/accounts")
-async def inbox_accounts(db: Db, user: CurrentUser):
+async def inbox_accounts(
+    db: Db,
+    user: CurrentUser,
+    lite: bool = Query(False, description="Skip 7d reply-latency aggregation for faster inbox paint"),
+):
     allowed = await _authorized_instance_ids(db, user)
     q = select(WhatsAppInstance).where(
         WhatsAppInstance.organization_id == ORG,
@@ -516,24 +746,41 @@ async def inbox_accounts(db: Db, user: CurrentUser):
             return {"items": []}
         q = q.where(WhatsAppInstance.id.in_(allowed))
     rows = (await db.execute(q.order_by(WhatsAppInstance.display_name))).scalars().all()
-    unread_by_inst: dict[int, int] = {}
+    unreplied_by_inst: dict[int, int] = {}
     if rows:
         inst_pks = [r.id for r in rows]
-        unread_rows = (
+        unreplied_rows = (
             await db.execute(
                 select(
                     WhatsAppConversation.whatsapp_instance_id,
-                    func.coalesce(func.sum(WhatsAppConversation.unread_count), 0),
+                    func.count(),
                 )
                 .where(
                     WhatsAppConversation.organization_id == ORG,
                     WhatsAppConversation.whatsapp_instance_id.in_(inst_pks),
                     newsletter_list_filter(),
+                    dm_inbox_filter(),
+                    _not_spam_filter(),
+                    WhatsAppConversation.awaiting_staff_reply.is_(True),
+                    WhatsAppConversation.status != "Resolved",
                 )
                 .group_by(WhatsAppConversation.whatsapp_instance_id)
             )
         ).all()
-        unread_by_inst = {int(iid): int(n or 0) for iid, n in unread_rows}
+        unreplied_by_inst = {int(iid): int(n or 0) for iid, n in unreplied_rows}
+    reply_by_inst: dict[int, dict[str, Any]] = {}
+    if not lite:
+        try:
+            from app.whatsapp_reply_latency import aggregate_reply_stats
+
+            allowed = await _authorized_instance_ids(db, user)
+            stats = await aggregate_reply_stats(db, period="7d", allowed_instance_ids=allowed)
+            for it in stats.get("items") or []:
+                iid = int(it.get("whatsapp_instance_id") or 0)
+                if iid:
+                    reply_by_inst[iid] = it
+        except Exception:  # noqa: BLE001
+            reply_by_inst = {}
     return {
         "items": [
             {
@@ -544,7 +791,14 @@ async def inbox_accounts(db: Db, user: CurrentUser):
                 "connected_phone_number": r.connected_phone_number,
                 "purpose": r.purpose,
                 "provider": getattr(r, "provider", None) or "evolution",
-                "unread_count": unread_by_inst.get(r.id, 0),
+                "unread_count": unreplied_by_inst.get(r.id, 0),
+                "unreplied_count": unreplied_by_inst.get(r.id, 0),
+                "reply_avg_label": (reply_by_inst.get(r.id) or {}).get("avg_label"),
+                "reply_office_avg_label": (reply_by_inst.get(r.id) or {}).get("office_avg_label"),
+                "reply_off_avg_label": (reply_by_inst.get(r.id) or {}).get("off_avg_label"),
+                "reply_count_7d": (reply_by_inst.get(r.id) or {}).get("count"),
+                "sarvam_voice_id": getattr(r, "sarvam_voice_id", "") or "",
+                "voice_tts_enabled": bool(getattr(r, "voice_tts_enabled", False)),
             }
             for r in rows
         ]
@@ -561,22 +815,64 @@ async def list_conversations(
     agent: str = Query("all"),
     status: str = Query(""),
     sort: str = Query("recent"),
+    campaign_uid: int | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    service_category: str = Query(""),
+    service_priority: str = Query(""),
+    include_metrics: bool = Query(True, description="Inbox badge counts — skip for fast list-only loads"),
+    include_total: bool = Query(True, description="Filtered thread total on first page"),
+    lite: bool = Query(False, description="Skip dealer lifetime sales on rows"),
+    metrics_only: bool = Query(False, description="Return metrics only (parallel with list fetch)"),
+    hide_groups: bool = Query(
+        True,
+        description="Exclude @g.us group chats from list + badge/category counts (Groups tab still shows groups)",
+    ),
 ):
+    if offset > 0:
+        include_metrics = False
+        include_total = False
     allowed = await _authorized_instance_ids(db, user)
     if allowed is not None and not allowed:
         return {"items": [], "total": 0, "metrics": _empty_metrics()}
 
+    # Campaign ID filter: only conversations that replied after that campaign's send.
+    campaign_conv_ids: set[int] | None = None
+    if campaign_uid is not None:
+        from app.campaign_reports import (
+            find_campaign_run_by_uid,
+            list_campaign_run_replied_conversation_ids,
+            refresh_campaign_run_replied_count,
+        )
+
+        run = await find_campaign_run_by_uid(db, int(campaign_uid))
+        if not run:
+            return {"items": [], "total": 0, "metrics": _empty_metrics()}
+        try:
+            await refresh_campaign_run_replied_count(db, run)
+            await db.flush()
+        except Exception:  # noqa: BLE001
+            pass
+        campaign_conv_ids = await list_campaign_run_replied_conversation_ids(db, run)
+        if not campaign_conv_ids:
+            return {"items": [], "total": 0, "metrics": _empty_metrics()}
+
     # Do NOT apply ``_lid_orphan_hidden_filter`` here — correlated EXISTS + ORDER BY
     # forces a multi-second nested loop even with LIMIT. Drop orphans after fetch.
+    # Groups tab intentionally shows @g.us even when hide_groups is on.
+    apply_hide_groups = bool(hide_groups) and (tab or "").strip().lower() != "groups"
     stmt = select(WhatsAppConversation).where(
         WhatsAppConversation.organization_id == ORG,
         newsletter_list_filter(),
+        _not_spam_filter(),
+        *((dm_inbox_filter(),) if apply_hide_groups else ()),
     )
     if allowed is not None:
         stmt = stmt.where(WhatsAppConversation.whatsapp_instance_id.in_(allowed))
+    if campaign_conv_ids is not None:
+        stmt = stmt.where(WhatsAppConversation.id.in_(campaign_conv_ids))
 
+    metrics_instance_id: int | None = None
     if instance_id:
         inst = await _owned_instance(db, instance_id) if _is_admin(user) else (
             await db.execute(
@@ -591,6 +887,7 @@ async def list_conversations(
             raise HTTPException(404, "Instance not found")
         if allowed is not None and inst.id not in allowed:
             raise HTTPException(403, "Not authorized for this instance")
+        metrics_instance_id = inst.id
         stmt = stmt.where(WhatsAppConversation.whatsapp_instance_id == inst.id)
 
     tab_l = tab.lower()
@@ -637,19 +934,59 @@ async def list_conversations(
             )
         )
 
+    sp = (service_priority or "").strip().title()
+    if sp in {"Med", "Mid"}:
+        sp = "Medium"
+    if sp in {"High", "Medium", "Low"}:
+        stmt = stmt.where(func.lower(WhatsAppConversation.priority) == sp.lower())
+
+    # Chip counts: same tab / account / search / priority scope, never the active category chip.
+    list_scope = stmt.whereclause
+
+    sc = (service_category or "").strip().lower()
+    if sc == "sales":
+        stmt = stmt.where(
+            func.lower(WhatsAppConversation.service_category).in_(["sales", "support"])
+        )
+    elif sc == "service":
+        stmt = stmt.where(func.lower(WhatsAppConversation.service_category) == "service")
+    elif sc == "cloud":
+        stmt = stmt.where(func.lower(WhatsAppConversation.service_category) == "cloud")
+    elif sc == "stamping":
+        stmt = stmt.where(func.lower(WhatsAppConversation.service_category) == "stamping")
+
+    if metrics_only:
+        metrics, cats = await asyncio.gather(
+            _metrics(db, allowed, instance_id=metrics_instance_id, hide_groups=apply_hide_groups),
+            _service_category_counts(db, list_scope),
+        )
+        metrics["service_categories"] = cats
+        return {"items": [], "has_more": False, "metrics": metrics}
+
     activity = _activity_at()
     if sort == "oldest":
         stmt = stmt.order_by(activity.asc().nullslast())
     elif sort == "unread":
         stmt = stmt.order_by(WhatsAppConversation.unread_count.desc(), activity.desc().nullslast())
     else:
-        stmt = stmt.order_by(activity.desc().nullslast())
+        # Default "Most recent": unread threads first, then recency within each group.
+        stmt = stmt.order_by(
+            desc(WhatsAppConversation.unread_count > 0),
+            activity.desc().nullslast(),
+        )
 
     # Over-fetch then drop @lid orphans in Python so page still fills to ``limit``.
     fetch_limit = min(max(limit + 40, limit), 200)
-    rows = (await db.execute(stmt.offset(offset).limit(fetch_limit))).scalars().all()
-    rows = (await _drop_lid_orphans(db, rows))[:limit]
-    total = offset + len(rows)
+    raw_rows = (await db.execute(stmt.offset(offset).limit(fetch_limit))).scalars().all()
+    filtered = await _drop_lid_orphans(db, raw_rows)
+    rows = filtered[:limit]
+    has_more = len(filtered) > limit
+    total: int | None = None
+    if offset == 0 and include_total:
+        total = int(
+            (await db.execute(select(func.count()).select_from(WhatsAppConversation).where(stmt.whereclause))).scalar()
+            or 0
+        )
 
     inst_ids = {r.whatsapp_instance_id for r in rows}
     emp_ids = {r.assigned_employee_id for r in rows if r.assigned_employee_id}
@@ -667,9 +1004,14 @@ async def list_conversations(
         for e in (await db.execute(select(Employee).where(Employee.id.in_(emp_ids)))).scalars().all():
             emp_map[e.id] = e.name
     dealer_map = await _dealers_map(db, dealer_ids)
+    crm_kind_map = await _crm_contact_kinds_map(db, rows, dealer_map=dealer_map)
 
     care_conv_ids = [r.id for r in rows if inst_provider.get(r.whatsapp_instance_id) == "meta_cloud"]
     inbound_map = await _last_inbound_at_map(db, care_conv_ids)
+
+    dealer_sales_map: dict[int, float] = {}
+    if not lite and dealer_map:
+        dealer_sales_map = await dealer_lifetime_sales_map(db, list(dealer_map.values()))
 
     items = [
         _conv_out(
@@ -677,13 +1019,29 @@ async def list_conversations(
             account=inst_name.get(r.whatsapp_instance_id, ""),
             agent=emp_map.get(r.assigned_employee_id or 0, ""),
             dealer=dealer_map.get(r.dealer_id) if getattr(r, "dealer_id", None) else None,
+            dealer_sales_total=(
+                dealer_sales_map.get(int(r.dealer_id))
+                if (not lite and getattr(r, "dealer_id", None))
+                else None
+            ),
             provider=inst_provider.get(r.whatsapp_instance_id, ""),
             last_inbound_at=inbound_map.get(r.id),
+            crm_contact_kind=crm_kind_map.get(r.id),
         )
         for r in rows
     ]
-    metrics = await _metrics(db, allowed)
-    return {"items": items, "total": total, "metrics": metrics}
+    items = await enrich_conversation_rows(db, rows, items)
+    out: dict[str, Any] = {"items": items, "has_more": has_more}
+    if include_metrics:
+        metrics, cats = await asyncio.gather(
+            _metrics(db, allowed, instance_id=metrics_instance_id, hide_groups=apply_hide_groups),
+            _service_category_counts(db, list_scope),
+        )
+        metrics["service_categories"] = cats
+        out["metrics"] = metrics
+    if total is not None:
+        out["total"] = total
+    return out
 
 
 def _empty_metrics() -> dict[str, Any]:
@@ -691,13 +1049,65 @@ def _empty_metrics() -> dict[str, Any]:
         "open": 0,
         "unread": 0,
         "unread_conversations": 0,
+        "unreplied": 0,
         "unassigned": 0,
         "agents_online": 0,
         "agents_total": 0,
+        "service_categories": _empty_service_category_counts(),
     }
 
 
-async def _metrics(db: AsyncSession, allowed: list[int] | None) -> dict[str, Any]:
+def _empty_service_category_counts() -> dict[str, int]:
+    return {"all": 0, "sales": 0, "service": 0, "cloud": 0, "stamping": 0}
+
+
+async def _service_category_counts(db: AsyncSession, list_scope) -> dict[str, int]:
+    """Per-category conversation totals for the current inbox list scope (excludes category chip)."""
+
+    def _count_stmt(*extra):
+        parts: list[Any] = []
+        if list_scope is not None:
+            parts.append(list_scope)
+        parts.extend(extra)
+        return select(func.count()).select_from(WhatsAppConversation).where(*parts)
+
+    all_n = (await db.execute(_count_stmt())).scalar() or 0
+    sales_n = (
+        await db.execute(
+            _count_stmt(func.lower(WhatsAppConversation.service_category).in_(["sales", "support"]))
+        )
+    ).scalar() or 0
+    service_n = (
+        await db.execute(
+            _count_stmt(func.lower(WhatsAppConversation.service_category) == "service")
+        )
+    ).scalar() or 0
+    cloud_n = (
+        await db.execute(
+            _count_stmt(func.lower(WhatsAppConversation.service_category) == "cloud")
+        )
+    ).scalar() or 0
+    stamp_n = (
+        await db.execute(
+            _count_stmt(func.lower(WhatsAppConversation.service_category) == "stamping")
+        )
+    ).scalar() or 0
+    return {
+        "all": int(all_n),
+        "sales": int(sales_n),
+        "service": int(service_n),
+        "cloud": int(cloud_n),
+        "stamping": int(stamp_n),
+    }
+
+
+async def _metrics(
+    db: AsyncSession,
+    allowed: list[int] | None,
+    *,
+    instance_id: int | None = None,
+    hide_groups: bool = True,
+) -> dict[str, Any]:
     """Inbox badge counts.
 
     Intentionally omits ``_lid_orphan_hidden_filter`` — that correlated EXISTS
@@ -712,9 +1122,14 @@ async def _metrics(db: AsyncSession, allowed: list[int] | None) -> dict[str, Any
     scope = [
         WhatsAppConversation.organization_id == ORG,
         newsletter_list_filter(),
+        _not_spam_filter(),
     ]
+    if hide_groups:
+        scope.append(dm_inbox_filter())
     if allowed is not None:
         scope.append(WhatsAppConversation.whatsapp_instance_id.in_(allowed))
+    if instance_id is not None:
+        scope.append(WhatsAppConversation.whatsapp_instance_id == instance_id)
 
     open_n = (
         await db.execute(
@@ -726,6 +1141,18 @@ async def _metrics(db: AsyncSession, allowed: list[int] | None) -> dict[str, Any
     unread_n = (
         await db.execute(
             select(func.coalesce(func.sum(WhatsAppConversation.unread_count), 0)).where(*scope)
+        )
+    ).scalar() or 0
+    unreplied_n = (
+        await db.execute(
+            select(func.count())
+            .select_from(WhatsAppConversation)
+            .where(
+                *scope,
+                dm_inbox_filter(),
+                WhatsAppConversation.awaiting_staff_reply.is_(True),
+                WhatsAppConversation.status != "Resolved",
+            )
         )
     ).scalar() or 0
     unassigned_n = (
@@ -754,7 +1181,8 @@ async def _metrics(db: AsyncSession, allowed: list[int] | None) -> dict[str, Any
     ).scalar() or 0
     return {
         "open": open_n,
-        "unread": int(unread_n),  # sum of unread inbound messages from phone
+        "unread": int(unread_n),  # sum of unread inbound messages from phone (incl. groups)
+        "unreplied": int(unreplied_n),  # 1:1 threads still needing a human reply (@g.us excluded)
         "unread_conversations": int(unread_convs),
         "unassigned": unassigned_n,
         "agents_online": agents_total,
@@ -777,6 +1205,17 @@ async def get_conversation(public_id: str, db: Db, user: CurrentUser):
     out = await _conv_out_with_instance(db, conv, agent=agent, dealer=dealer, inst=inst)
     out["ai_outline"] = getattr(conv, "ai_outline", None) or ""
     out["ai_outline_at"] = getattr(conv, "ai_outline_at", None)
+    holds = await hold_since_map(db, [conv])
+    summary = parse_cached_outline_summary(getattr(conv, "ai_outline", None) or "")
+    out.update(resolve_service_fields(conv, summary, hold_since=holds.get(conv.id)))
+    try:
+        from app.whatsapp_new_messenger import load_onboarding_for_conv
+
+        onboarding = await load_onboarding_for_conv(db, conv)
+        if onboarding:
+            out["onboarding"] = onboarding
+    except Exception:  # noqa: BLE001
+        pass
     return out
 
 
@@ -806,46 +1245,74 @@ async def update_contact(public_id: str, body: ContactUpdateIn, db: Db, user: Cu
     return await _conv_out_with_instance(db, conv, agent=agent, dealer=dealer, inst=inst)
 
 
+def _dealer_link_search_item(d: Dealer) -> dict[str, Any]:
+    return {
+        "id": d.id,
+        "name": d.name or "",
+        "company": d.company or "",
+        "phone": d.phone or "",
+        "code": d.zoho_contact_id or "",
+        "city": d.city or "",
+        "state": d.state or "",
+    }
+
+
 @router.get("/api/whatsapp/conversations/{public_id}/dealers/search")
 async def search_dealers_for_conversation(
     public_id: str,
     db: Db,
     user: CurrentUser,
     q: str = Query(""),
-    limit: int = Query(12, ge=1, le=40),
+    limit: int = Query(20, ge=1, le=40),
 ):
-    """Search dealers to link — same last-10 phone overlap pattern used elsewhere."""
+    """Fuzzy name/company search plus phone and Zoho code matches for linking a dealer."""
+    from app.ai.tools import _search_dealer_rows
+    from app.dealer_exclusions import dealer_not_excluded_clause
+
     await _get_conversation(db, public_id, user)
-    stmt = select(Dealer).order_by(Dealer.name.asc()).limit(limit)
     term = q.strip()
-    if term:
+    if not term:
+        return {"items": []}
+
+    seen: dict[int, Dealer] = {}
+    order: list[int] = []
+
+    for dealer, _score in await _search_dealer_rows(db, term, limit=limit):
+        if dealer.id not in seen:
+            seen[dealer.id] = dealer
+            order.append(dealer.id)
+
+    if len(order) < limit:
         like = f"%{term}%"
         phone_key = normalize_in_mobile(term)
-        clauses = [
-            Dealer.name.ilike(like),
-            Dealer.company.ilike(like),
+        phone_clauses = [
             Dealer.phone.ilike(like),
             Dealer.zoho_contact_id.ilike(like),
-            Dealer.city.ilike(like),
         ]
         if phone_key:
-            clauses.append(_normalized_phone_sql(Dealer.phone) == phone_key)
-        stmt = stmt.where(or_(*clauses))
-    rows = (await db.execute(stmt)).scalars().all()
-    return {
-        "items": [
-            {
-                "id": d.id,
-                "name": d.name or "",
-                "company": d.company or "",
-                "phone": d.phone or "",
-                "code": d.zoho_contact_id or "",
-                "city": d.city or "",
-                "state": d.state or "",
-            }
-            for d in rows
-        ]
-    }
+            phone_clauses.append(_normalized_phone_sql(Dealer.phone) == phone_key)
+            tail = phone_key[-10:] if len(phone_key) >= 10 else phone_key
+            if tail:
+                phone_clauses.append(_normalized_phone_sql(Dealer.phone).like(f"%{tail}%"))
+        visible = dealer_not_excluded_clause(Dealer.name, Dealer.company, Dealer.zoho_contact_id)
+        extra = (
+            await db.execute(
+                select(Dealer)
+                .where(visible)
+                .where(or_(*phone_clauses))
+                .order_by(Dealer.name.asc())
+                .limit(limit)
+            )
+        ).scalars().all()
+        for d in extra:
+            if d.id not in seen:
+                seen[d.id] = d
+                order.append(d.id)
+            if len(order) >= limit:
+                break
+
+    rows = [seen[i] for i in order[:limit]]
+    return {"items": [_dealer_link_search_item(d) for d in rows]}
 
 
 @router.post("/api/whatsapp/conversations/{public_id}/link-dealer")
@@ -864,6 +1331,24 @@ async def link_dealer(public_id: str, body: LinkDealerIn, db: Db, user: CurrentU
         emp = await db.get(Employee, conv.assigned_employee_id)
         agent = emp.name if emp else ""
     return await _conv_out_with_instance(db, conv, agent=agent, dealer=dealer, inst=inst)
+
+
+@router.post("/api/whatsapp/conversations/{public_id}/unlink-dealer")
+async def unlink_dealer(public_id: str, db: Db, user: CurrentUser):
+    conv = await _get_conversation(db, public_id, user)
+    if not conv.dealer_id:
+        raise HTTPException(400, "No dealer linked")
+    conv.dealer_id = None
+    if (conv.customer_type or "").strip().casefold() == "dealer":
+        conv.customer_type = "Customer"
+    await db.commit()
+    await db.refresh(conv)
+    inst = await db.get(WhatsAppInstance, conv.whatsapp_instance_id)
+    agent = ""
+    if conv.assigned_employee_id:
+        emp = await db.get(Employee, conv.assigned_employee_id)
+        agent = emp.name if emp else ""
+    return await _conv_out_with_instance(db, conv, agent=agent, dealer=None, inst=inst)
 
 
 @router.get("/api/whatsapp/conversations/{public_id}/outline")
@@ -915,8 +1400,12 @@ async def generate_outline(
     result = await refresh_conversation_outline(db, conv, user=user, force=force)
     if result.get("ok"):
         if not result.get("skipped"):
-            await db.commit()
-            await db.refresh(conv)
+            try:
+                await db.commit()
+                await db.refresh(conv)
+            except Exception as exc:  # noqa: BLE001
+                await db.rollback()
+                raise HTTPException(502, f"Could not save outline: {exc}") from exc
         return {
             "outline": result.get("outline") or "",
             "summary": result.get("summary") or {},
@@ -1178,6 +1667,7 @@ async def _send_and_store(
     media_url: str = "",
     media_type: str = "",
     media_name: str = "",
+    evo_media_b64: str | None = None,
 ) -> WhatsAppMessage:
     from app.cloud_whatsapp import is_meta_cloud_instance, send_care_cloud_text
 
@@ -1196,11 +1686,19 @@ async def _send_and_store(
     # Persist media on VPS disk; Postgres keeps only the public path + metadata
     stored_media_url = media_url or ""
     evo_media_payload = media_url or ""
-    if media_url and media_type:
+    if (media_url or evo_media_b64) and media_type:
         if care:
             raise HTTPException(400, "Care Cloud WhatsApp replies support text only for now")
         try:
-            if media_url.startswith("data:") or (
+            # AI Agent / batch can pass pre-encoded Evolution payload to avoid re-reading
+            # large campaign videos for every recipient.
+            if evo_media_b64:
+                evo_media_payload = evo_media_b64
+                if media_url.startswith(PUBLIC_PREFIX):
+                    stored_media_url = media_url
+                elif not stored_media_url:
+                    stored_media_url = media_url or ""
+            elif media_url.startswith("data:") or (
                 not media_url.startswith(("http://", "https://", PUBLIC_PREFIX)) and len(media_url) > 200
             ):
                 public_url, _, raw = save_data_url(media_url, media_type=media_type, filename=media_name)
@@ -1237,9 +1735,20 @@ async def _send_and_store(
     )
     db.add(msg)
     await db.flush()
+    # Commit BEFORE Evolution/Care so the fromMe webhook can match client_message_id
+    # (or body twin) instead of inserting a second "WhatsApp" outbound row.
+    try:
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        await db.flush()
 
     recipient = _send_recipient(conv)
     if not recipient:
+        msg.status = "failed"
+        try:
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            await db.flush()
         raise HTTPException(400, "Conversation has no valid WhatsApp recipient")
     try:
         if care:
@@ -1275,19 +1784,28 @@ async def _send_and_store(
             msg.external_message_id = ext
             # Evolution accepted the message — double gray tick (server/device ack)
             msg.status = "delivered"
-    except HTTPException:
+    except HTTPException as http_exc:
+        detail = str(getattr(http_exc, "detail", "") or http_exc)
         msg.status = "failed"
-        msg.body = text
-        conv.last_message_preview = f"Failed: {text[:200]}"
-        await db.flush()
+        # Keep caption if any; always surface Evolution/gateway error in chat preview
+        fail_note = detail.strip() or "Send failed"
+        msg.body = text.strip() if (text or "").strip() else f"[send failed] {fail_note}"[:2000]
+        conv.last_message_preview = f"Failed: {fail_note}"[:255]
+        try:
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            await db.flush()
         raise
     except Exception as exc:  # noqa: BLE001
+        fail_note = str(exc).strip() or "Send failed"
         msg.status = "failed"
-        msg.body = text
-        conv.last_message_preview = f"Failed: {text[:200]}"
-        await db.flush()
+        msg.body = text.strip() if (text or "").strip() else f"[send failed] {fail_note}"[:2000]
+        conv.last_message_preview = f"Failed: {fail_note}"[:255]
+        try:
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            await db.flush()
         raise HTTPException(502, f"Send failed: {exc}") from exc
-
     now = datetime.now(timezone.utc)
     if media_type == "audio":
         conv.last_message_preview = "🎤 Voice message"
@@ -1302,7 +1820,9 @@ async def _send_and_store(
     conv.last_message_at = now
     # Outbound reply from CRM = conversation is being handled → clear unread/New
     # (Opening/viewing a chat must NOT clear unread — only a successful staff reply.)
-    clear_conversation_unread(conv)
+    from app.whatsapp_reply_latency import complete_staff_reply
+
+    await complete_staff_reply(db, conv, replied_at=now, source="crm", inst=inst, msg=msg)
     await _send_whatsapp_read_receipts(db, conv, inst)
     if conv.status in {"Pending Customer Reply", "Resolved"}:
         conv.status = "Open"
@@ -1313,14 +1833,40 @@ async def _send_and_store(
             if emp:
                 conv.assigned_employee_id = emp.id
 
-    # Auto-transcribe outbound voice after media is stored locally.
-    if (media_type or "").lower() in {"audio", "ptt", "voice"} and (
+    # Persist status / assignment updates before fire-and-forget AI work.
+    try:
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        await db.flush()
+
+    # Auto-transcribe outbound voice/video after media is stored locally.
+    if (media_type or "").lower() in {"audio", "ptt", "voice", "video"} and (
         stored_media_url or ""
     ).startswith(PUBLIC_PREFIX):
         try:
             from app.sarvam_transcribe import schedule_transcription
 
+            if not (msg.transcription_status or "").strip():
+                msg.transcription_status = "pending"
+                try:
+                    await db.commit()
+                except Exception:  # noqa: BLE001
+                    await db.flush()
             schedule_transcription(msg.id)
+        except Exception:  # noqa: BLE001
+            pass
+    else:
+        try:
+            from app.sarvam_transcribe import is_text_translatable_message, schedule_text_translation
+
+            if is_text_translatable_message(msg):
+                if not (msg.transcription_status or "").strip():
+                    msg.transcription_status = "pending"
+                    try:
+                        await db.commit()
+                    except Exception:  # noqa: BLE001
+                        await db.flush()
+                schedule_text_translation(msg.id)
         except Exception:  # noqa: BLE001
             pass
     return msg
@@ -1435,6 +1981,25 @@ async def resolve_conversation(public_id: str, body: ResolveIn, db: Db, user: Cu
     return {"ok": True, "status": conv.status}
 
 
+@router.post("/api/whatsapp/conversations/{public_id}/spam")
+async def mark_conversation_spam(public_id: str, body: MarkSpamIn, db: Db, user: CurrentUser):
+    """Soft-flag as spam: hide from inbox + counts; keep messages for DB recovery."""
+    if not body.confirmed:
+        raise HTTPException(400, "Confirmation required — check confirm it is spam")
+    conv = await _get_conversation(db, public_id, user)
+    if getattr(conv, "is_spam", False):
+        return {"ok": True, "is_spam": True}
+    conv.is_spam = True
+    conv.spam_at = datetime.now(timezone.utc)
+    conv.spam_by_user_id = user.id
+    conv.awaiting_staff_reply = False
+    conv.awaiting_since = None
+    if (conv.unread_count or 0) != 0:
+        conv.unread_count = 0
+    await db.commit()
+    return {"ok": True, "is_spam": True}
+
+
 @router.post("/api/whatsapp/conversations/{public_id}/reopen")
 async def reopen_conversation(public_id: str, db: Db, user: CurrentUser):
     conv = await _get_conversation(db, public_id, user)
@@ -1461,6 +2026,7 @@ async def list_agents(db: Db, user: CurrentUser):
                 .where(
                     WhatsAppConversation.assigned_employee_id == e.id,
                     WhatsAppConversation.status != "Resolved",
+                    _not_spam_filter(),
                 )
             )
         ).scalar() or 0
@@ -1481,7 +2047,7 @@ async def list_agents(db: Db, user: CurrentUser):
 
 @router.post("/api/whatsapp/messages/{message_id}/transcribe")
 async def retry_message_transcription(message_id: str, db: Db, user: CurrentUser):
-    """Staff retry for Sarvam STT on a voice note (idempotent when already completed)."""
+    """Staff retry for voice STT or text→Malayalam translate (idempotent when completed)."""
     msg = (
         await db.execute(select(WhatsAppMessage).where(WhatsAppMessage.public_id == message_id))
     ).scalar_one_or_none()
@@ -1491,10 +2057,14 @@ async def retry_message_transcription(message_id: str, db: Db, user: CurrentUser
     if not conv:
         raise HTTPException(404, "Conversation not found")
     await _get_conversation(db, conv.public_id, user)
-    if (msg.media_type or "").lower() not in {"audio", "ptt", "voice"}:
-        raise HTTPException(400, "Only voice notes can be transcribed")
-    from app.sarvam_transcribe import retry_transcription_by_public_id
+    from app.sarvam_transcribe import (
+        is_text_translatable_message,
+        retry_transcription_by_public_id,
+    )
 
+    is_speech = (msg.media_type or "").lower() in {"audio", "ptt", "voice", "video"}
+    if not is_speech and not is_text_translatable_message(msg):
+        raise HTTPException(400, "Only voice/video or text messages can be transcribed/translated")
     result = await retry_transcription_by_public_id(message_id)
     if result.get("reason") == "not-found":
         raise HTTPException(404, "Message not found")
@@ -1515,13 +2085,48 @@ async def get_wa_media(filename: str):
         ".webp": "image/webp",
         ".gif": "image/gif",
         ".webm": "audio/webm",
-        ".ogg": "audio/ogg",
+        # WhatsApp PTT is Opus-in-Ogg; codecs hint helps browsers show real duration (not 0:00).
+        ".ogg": "audio/ogg; codecs=opus",
         ".mp3": "audio/mpeg",
         ".mp4": "video/mp4",
         ".pdf": "application/pdf",
     }.get(suffix, "application/octet-stream")
     # inline so browser displays images/audio instead of forcing download
     return FileResponse(path, media_type=mime, filename=path.name, content_disposition_type="inline")
+
+
+class VisitingCardExtractIn(BaseModel):
+    image_url: str = Field(default="", max_length=500)
+    image_base64: str = Field(default="", max_length=5_000_000)
+    mime: str = Field(default="image/jpeg", max_length=120)
+    resolve_places: bool = True
+    source: str = Field(default="Visiting Card", max_length=80)
+
+
+@router.post("/api/whatsapp/visiting-card/extract")
+async def extract_visiting_card_photo(body: VisitingCardExtractIn, user: CurrentUser) -> dict[str, Any]:
+    """Gemini vision reads a visiting-card photo; Places fills missing state/district."""
+    _ = user
+    from app.visiting_card import extract_visiting_card
+
+    if not (body.image_url or "").strip() and not (body.image_base64 or "").strip():
+        raise HTTPException(400, "Provide image_url or image_base64")
+    try:
+        return await extract_visiting_card(
+            image_url=body.image_url or "",
+            image_base64=body.image_base64 or "",
+            mime=body.mime or "image/jpeg",
+            resolve_places=bool(body.resolve_places),
+            source=(body.source or "Visiting Card").strip() or "Visiting Card",
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc) or "Media not found") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc) or "Invalid image") from exc
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc) or "AI not configured") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Visiting card extract failed: {type(exc).__name__}") from exc
 
 
 @router.post("/api/whatsapp/conversations/{public_id}/avatar")
@@ -1677,7 +2282,7 @@ async def sync_conversation_history(public_id: str, db: Db, user: CurrentUser):
 
         wa = "".join(c for c in (conv.customer_phone or "") if c.isdigit())
         try:
-            result = await sync_care_from_firestore(db, message_wa_id=wa or None, conversation_limit=5)
+            result = await sync_care_from_firestore(db, message_wa_id=wa or None)
         except Exception as exc:  # noqa: BLE001
             return {
                 "ok": False,

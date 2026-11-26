@@ -102,6 +102,107 @@ _EXTRACT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "abbreviation",
     ),
+    # "teach ai dealer = weighing scale dealer" / "dealer = weighing scale related only"
+    (
+        re.compile(
+            r"^\s*(?:teach\s+ai\s+)?dealer\s*=\s*(.+?)\s*$",
+            re.I | re.S,
+        ),
+        "fact",
+    ),
+]
+
+# Org-wide standing rules (upserted on migrate — always in system prompt via ai_knowledge).
+BUILTIN_KNOWLEDGE: list[dict[str, str]] = [
+    {
+        "kind": "fact",
+        "key": "dealer",
+        "value": (
+            "Always means weighing scale dealer in YesWeigh CRM. Google Places / Dealer Finder "
+            "use DEFAULT_CATEGORIES (7 weighing-scale queries). Never generic or other-product dealers."
+        ),
+        "notes": "Standing rule — AI Agent + Dealer Finder; do not search unrelated Places categories",
+        "source": "manual",
+    },
+    {
+        "kind": "alias",
+        "key": "dealers",
+        "value": "weighing scale dealers (Google / Dealer Finder discovery)",
+        "notes": "Same hard rule as dealer",
+        "source": "manual",
+    },
+    {
+        "kind": "fact",
+        "key": "dealer_finder_list_exclusions",
+        "value": (
+            "When the user asks to remove/exclude/drop a district, city, or keyword from a "
+            "Dealer Finder final phone-NEW list, call filter_dealer_finder_results or "
+            "get_dealer_finder_results with exclude_districts / exclude_cities / exclude_keywords "
+            "(case-insensitive; keywords match name, city, or district contains). "
+            "Do NOT re-run start_dealer_finder. Refresh the chat card with the new unique phone NEW "
+            "count. Pass the same exclude_* args on import_dealer_finder_leads after user confirms."
+        ),
+        "notes": "List hygiene after statewide scan — no code deploy per filter",
+        "source": "manual",
+    },
+    {
+        "kind": "fact",
+        "key": "dealer_finder_mobile_only",
+        "value": (
+            "Dealer Finder phone-NEW lists are mobile-only: require a phone and classify "
+            "Indian numbers via phone_util (10-digit starting 6–9 after +91/0 normalization; "
+            "drop landlines such as 0484… STD and numbers without phone). "
+            "When the user asks to remove landlines or keep only mobile/WhatsApp numbers, "
+            "call filter_dealer_finder_results or get_dealer_finder_results with mobile_only=true "
+            "(no re-scan). Refresh the chat card with the new unique mobile NEW count."
+        ),
+        "notes": "Shared phone_filters helper — list + import with_phone_only",
+        "source": "manual",
+    },
+    {
+        "kind": "alias",
+        "key": "pondicherry",
+        "value": "Puducherry (UT) — Dealer Finder state scope",
+        "notes": "Spelling alias for statewide jobs",
+        "source": "manual",
+    },
+    {
+        "kind": "fact",
+        "key": "custom_audience_from_leads",
+        "value": (
+            "Custom Audience create/new from CRM Leads (Audience page /assets) uses create_audience "
+            "with source=leads and filters.state — NEVER start_dealer_finder or Google Places statewide "
+            "dealer scan. Phrases: create audience … from leads, not from dealer, state = X|Y. "
+            "Tamil Nadu / Puducherry in the audience command is a CRM Leads filter, not Dealer Finder."
+        ),
+        "notes": "Prevents TN/PY audience loop into Dealer Finder confirm",
+        "source": "manual",
+    },
+    {
+        "kind": "fact",
+        "key": "whatsapp_dealer_enquiry",
+        "value": (
+            "WhatsApp dealer enquiry = customer asks dealer/wholesale/distributor price, dealer model list, "
+            "or becoming a dealer (still Sales service_category, enquiry_subtype dealer enquiry). "
+            "Auto-upsert CRM Lead (source WhatsApp, tag Dealer enquiry) unless phone is an existing Dealer. "
+            "Sales attended = outbound on Evolution lines (Biju/Visakh/Shibin), not Care handoff alone. "
+            "Unattended: High priority, call with dealer prices, assign sales line."
+        ),
+        "notes": "Care + sales inbox — leads + cross-instance attendance",
+        "source": "manual",
+    },
+    {
+        "kind": "fact",
+        "key": "puducherry_dealer_finder_scope",
+        "value": (
+            "Pondicherry / Puducherry dealer or Google Places discovery is strictly state=Puducherry "
+            "(union territory). Do not mix Kerala or Tamil Nadu CRM/Places rows into that job or list. "
+            "Districts include Karaikal, Mahe, Puducherry, Yanam; user may exclude Mahe (or others) "
+            "from the final phone-NEW table via list exclusions without cancelling the scan."
+        ),
+        "notes": "Standing scope for Puducherry UT dealer finder tasks",
+        "source": "manual",
+    },
 ]
 
 
@@ -330,6 +431,23 @@ def row_to_dict(row: AiKnowledge) -> dict[str, Any]:
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
     }
+
+
+async def seed_builtin_knowledge(db: AsyncSession, *, organization_id: str = ORG) -> list[str]:
+    """Ensure standing org rules exist in ai_knowledge (idempotent upsert)."""
+    touched: list[str] = []
+    for item in BUILTIN_KNOWLEDGE:
+        await upsert_knowledge(
+            db,
+            kind=item["kind"],
+            key=item["key"],
+            value=item["value"],
+            notes=item.get("notes") or "",
+            source=item.get("source") or "manual",
+            organization_id=organization_id,
+        )
+        touched.append(item["key"])
+    return touched
 
 
 async def auto_learn_from_message(

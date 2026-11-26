@@ -1,9 +1,45 @@
 """Evolution GO adapter — all remote calls stay server-side."""
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Any
 
 import httpx
+
+from app.phone_util import to_evolution_number
+
+logger = logging.getLogger("crm.evolution")
+
+# WhatsApp CDN / mmg often returns 503 briefly on large video uploads (~30 MB).
+_MEDIA_SEND_MAX_ATTEMPTS = 4
+_MEDIA_SEND_TIMEOUT_S = 240.0
+_MEDIA_RETRY_BACKOFF_S = (2.0, 5.0, 12.0)
+
+
+def is_transient_media_upload_error(message: str, *, status_code: int | None = None) -> bool:
+    """True when a media send failure is worth retrying (WA CDN / gateway blip)."""
+    if status_code in {408, 429, 500, 502, 503, 504}:
+        return True
+    e = (message or "").lower()
+    if not e:
+        return False
+    markers = (
+        "upload failed with status code 503",
+        "upload failed with status code 502",
+        "upload failed with status code 500",
+        "upload failed with status code 429",
+        "status code 503",
+        "status code 502",
+        "service unavailable",
+        "temporarily unavailable",
+        "try again",
+        "timeout",
+        "timed out",
+        "gateway timeout",
+        "bad gateway",
+    )
+    return any(m in e for m in markers)
 
 
 class EvolutionService:
@@ -208,7 +244,11 @@ class EvolutionService:
             return data
 
     async def send_text(self, instance_token: str, number: str, text: str, msg_id: str | None = None) -> dict[str, Any]:
-        body: dict[str, Any] = {"number": number, "text": text, "formatJid": True}
+        body: dict[str, Any] = {
+            "number": to_evolution_number(number) or number,
+            "text": text,
+            "formatJid": True,
+        }
         if msg_id:
             body["id"] = msg_id
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -302,7 +342,7 @@ class EvolutionService:
         msg_id: str | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
-            "number": number,
+            "number": to_evolution_number(number) or number,
             "type": media_type,
             "url": url,
             "formatJid": True,
@@ -313,16 +353,62 @@ class EvolutionService:
             body["caption"] = caption
         if msg_id:
             body["id"] = msg_id
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            r = await client.post(
-                f"{self.base_url}/send/media",
-                headers=self._headers(instance_token),
-                json=body,
-            )
-            data = r.json() if r.content else {}
-            if not r.is_success:
-                raise RuntimeError(data.get("message") or data.get("error") or r.text or "Media send failed")
-            return data
+        # Large campaign videos (e.g. GATC RAM ~30 MB) need headroom + WA CDN retry.
+        last_err: Exception | None = None
+        async with httpx.AsyncClient(timeout=_MEDIA_SEND_TIMEOUT_S) as client:
+            for attempt in range(1, _MEDIA_SEND_MAX_ATTEMPTS + 1):
+                try:
+                    r = await client.post(
+                        f"{self.base_url}/send/media",
+                        headers=self._headers(instance_token),
+                        json=body,
+                    )
+                    data = r.json() if r.content else {}
+                    if r.is_success:
+                        if attempt > 1:
+                            logger.info(
+                                "send/media succeeded on retry %s/%s for %s",
+                                attempt,
+                                _MEDIA_SEND_MAX_ATTEMPTS,
+                                body.get("number"),
+                            )
+                        return data
+                    err_msg = (
+                        data.get("message")
+                        or data.get("error")
+                        or r.text
+                        or "Media send failed"
+                    )
+                    last_err = RuntimeError(str(err_msg))
+                    if not is_transient_media_upload_error(
+                        str(err_msg), status_code=r.status_code
+                    ):
+                        raise last_err
+                except httpx.TimeoutException as exc:
+                    last_err = RuntimeError(f"Media send timed out after {_MEDIA_SEND_TIMEOUT_S:.0f}s")
+                    if not is_transient_media_upload_error(str(last_err)):
+                        raise last_err from exc
+                except RuntimeError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    last_err = exc
+                    if not is_transient_media_upload_error(str(exc)):
+                        raise
+
+                if attempt >= _MEDIA_SEND_MAX_ATTEMPTS:
+                    break
+                delay = _MEDIA_RETRY_BACKOFF_S[min(attempt - 1, len(_MEDIA_RETRY_BACKOFF_S) - 1)]
+                logger.warning(
+                    "send/media transient failure attempt %s/%s for %s: %s — retry in %.0fs",
+                    attempt,
+                    _MEDIA_SEND_MAX_ATTEMPTS,
+                    body.get("number"),
+                    last_err,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+
+        raise RuntimeError(str(last_err) if last_err else "Media send failed")
 
     async def mark_read(self, instance_token: str, number: str, message_ids: list[str]) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=20.0) as client:

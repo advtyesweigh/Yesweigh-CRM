@@ -29,6 +29,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -167,14 +168,80 @@ def image_ext(url: str) -> str:
     return ".jpg"
 
 
-async def sign_in(client: httpx.AsyncClient, api_key: str, email: str, password: str) -> str:
+# Reuse ID tokens (+ refresh) across Care backfill / catalog / callable calls.
+_TOKEN_CACHE: dict[str, tuple[str, str, float]] = {}  # cache_key -> (id_token, refresh_token, expires_at)
+_TOKEN_LOCK = asyncio.Lock()
+_TOKEN_REFRESH_SKEW_S = 180.0
+
+
+class FirebaseAuthError(RuntimeError):
+    pass
+
+
+async def _sign_in_password(
+    client: httpx.AsyncClient, api_key: str, email: str, password: str
+) -> tuple[str, str, int]:
     url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={api_key}"
     r = await client.post(url, json={"email": email, "password": password, "returnSecureToken": True})
     data = r.json()
     if not r.is_success or not data.get("idToken"):
         msg = (data.get("error") or {}).get("message") or r.text[:200]
-        raise SystemExit(f"Firebase Auth failed: {msg}")
-    return str(data["idToken"])
+        raise FirebaseAuthError(f"Firebase Auth failed: {msg}")
+    refresh = str(data.get("refreshToken") or "")
+    try:
+        expires_in = int(data.get("expiresIn") or 3600)
+    except (TypeError, ValueError):
+        expires_in = 3600
+    return str(data["idToken"]), refresh, expires_in
+
+
+async def _refresh_id_token(client: httpx.AsyncClient, api_key: str, refresh_token: str) -> tuple[str, str, int]:
+    url = f"https://securetoken.googleapis.com/v1/token?key={api_key}"
+    r = await client.post(
+        url,
+        data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    data = r.json()
+    if not r.is_success or not data.get("id_token"):
+        msg = (data.get("error") or {}).get("message") or r.text[:200]
+        raise FirebaseAuthError(f"Firebase token refresh failed: {msg}")
+    try:
+        expires_in = int(data.get("expires_in") or 3600)
+    except (TypeError, ValueError):
+        expires_in = 3600
+    return str(data["id_token"]), str(data.get("refresh_token") or refresh_token), expires_in
+
+
+async def get_firebase_id_token(
+    client: httpx.AsyncClient, api_key: str, email: str, password: str
+) -> str:
+    """Return a cached Firebase ID token; password sign-in only when cache/refresh miss."""
+    cache_key = f"{api_key}:{email.strip().lower()}"
+    now = time.monotonic()
+    async with _TOKEN_LOCK:
+        cached = _TOKEN_CACHE.get(cache_key)
+        if cached:
+            id_tok, refresh_tok, expires_at = cached
+            if expires_at > now + _TOKEN_REFRESH_SKEW_S:
+                return id_tok
+            if refresh_tok:
+                try:
+                    id_tok, refresh_tok, expires_in = await _refresh_id_token(client, api_key, refresh_tok)
+                    _TOKEN_CACHE[cache_key] = (id_tok, refresh_tok, now + float(expires_in))
+                    return id_tok
+                except FirebaseAuthError:
+                    pass
+        id_tok, refresh_tok, expires_in = await _sign_in_password(client, api_key, email, password)
+        _TOKEN_CACHE[cache_key] = (id_tok, refresh_tok, now + float(expires_in))
+        return id_tok
+
+
+async def sign_in(client: httpx.AsyncClient, api_key: str, email: str, password: str) -> str:
+    try:
+        return await get_firebase_id_token(client, api_key, email, password)
+    except FirebaseAuthError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 async def list_collection(

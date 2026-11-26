@@ -1,9 +1,13 @@
 import { useMemo } from "react";
 import { useSearchParams } from "react-router-dom";
 import Adms from "./Adms";
+import AutoReplySettings from "./AutoReplySettings";
 import Employees from "./Employees";
 import EvolutionSettings from "./EvolutionSettings";
 import GeminiSettings from "./GeminiSettings";
+import KnowledgeBase from "./KnowledgeBase";
+import GooglePlaceSettings from "./GooglePlaceSettings";
+import VoiceCloneSettings from "./VoiceCloneSettings";
 import VpsHealth from "./VpsHealth";
 import ZohoSettings from "./ZohoSettings";
 
@@ -17,6 +21,10 @@ export const SETTINGS_TABS = [
   { id: "meta", label: "Meta" },
   { id: "yesone", label: "yesone" },
   { id: "gemini", label: "Gemini" },
+  { id: "knowledge", label: "Knowledge" },
+  { id: "autoreply", label: "Auto-Reply" },
+  { id: "voices", label: "Voice Clones" },
+  { id: "google-place", label: "Google Place" },
 ] as const;
 
 export type SettingsTabId = (typeof SETTINGS_TABS)[number]["id"];
@@ -63,6 +71,10 @@ export default function Settings() {
         <ComingSoonPanel title="yesone" subtitle="Coming soon — configure YesOne product integration." />
       )}
       {tab === "gemini" && <GeminiSettings />}
+      {tab === "knowledge" && <KnowledgeBase />}
+      {tab === "autoreply" && <AutoReplySettings />}
+      {tab === "voices" && <VoiceCloneSettings />}
+      {tab === "google-place" && <GooglePlaceSettings />}
     </div>
   );
 }

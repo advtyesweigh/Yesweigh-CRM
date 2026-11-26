@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">YES CRM</string>
+    <string name="brand_title">YESWEIGH</string>
+    <string name="brand_subtitle">STAFF WORKSPACE</string>
+    <string name="login_title">YES CRM</string>
+    <string name="login_subtitle">Sign in with your YesWeigh CRM agent account</string>
+    <string name="consent_copy">YES CRM syncs call logs from this phone to company CRM (crm.yesweigh.in) so sales activity can be reviewed. Only your CRM login can own these logs. After you allow permissions, sync starts automatically and keeps running in the background. You can stop sync or sign out anytime.</string>
+    <string name="battery_tip">For reliable background sync on Xiaomi / Oppo / Vivo / Samsung: set Battery → Unrestricted for YES CRM, and enable Autostart / Allow background activity in phone settings.</string>
+    <string name="battery_unrestricted">Allow unrestricted battery</string>
+    <string name="email_hint">Email or Aadhaar</string>
+    <string name="password_hint">Password</string>
+    <string name="sign_in">Sign in</string>
+    <string name="sign_out">Sign out</string>
+    <string name="grant_permissions">Grant call permissions</string>
+    <string name="stop_sync">Stop sync</string>
+    <string name="resume_sync">Resume sync</string>
+    <string name="sync_status">Sync status</string>
+    <string name="permission_status">Permissions</string>
+    <string name="last_sync">Last sync</string>
+    <string name="agent_label">Signed in as</string>
+    <string name="fg_channel_name">Call sync</string>
+    <string name="fg_notification_title">YES CRM syncing calls</string>
+    <string name="fg_notification_text">Pushing your call activity to YesWeigh CRM</string>
+    <string name="nav_home">Home</string>
+    <string name="nav_whatsapp">WhatsApp</string>
+    <string name="nav_calls">Calls</string>
+    <string name="nav_ai">AI Agent</string>
+    <string name="nav_attendance">Attendance</string>
+    <string name="notifications">Notifications</string>
+    <string name="profile">Profile</string>
+    <string name="open_whatsapp">Open WhatsApp</string>
+    <string name="apply_leave">Apply leave</string>
+    <string name="search_calls">Search name or number</string>
+</resources>

@@ -28,13 +28,26 @@ class LeadIn(BaseModel):
     phone: str = ""
     email: str = ""
     company: str = ""
+    contact_person: str = ""
+    business_type: str = ""
+    customer_website: str = ""
+    lead_score: Optional[int] = Field(default=None, ge=0, le=100)
     city: str = ""
     district: str = ""
     state: str = ""
     pin: str = ""
+    address: str = ""
     source: str = "manual"
     status: str = "new"
+    priority: str = "medium"
+    product_category: str = ""
+    estimated_value: Optional[Decimal] = None
+    campaign: str = ""
+    tags: str = ""
+    next_follow_up: Optional[date] = None
+    last_contacted: Optional[date] = None
     notes: str = ""
+    owner_id: Optional[int] = None
 
 
 class LeadUpdate(BaseModel):
@@ -44,17 +57,31 @@ class LeadUpdate(BaseModel):
     phone: Optional[str] = None
     email: Optional[str] = None
     company: Optional[str] = None
+    contact_person: Optional[str] = None
+    business_type: Optional[str] = None
+    customer_website: Optional[str] = None
+    lead_score: Optional[int] = Field(default=None, ge=0, le=100)
     city: Optional[str] = None
     district: Optional[str] = None
     state: Optional[str] = None
     pin: Optional[str] = None
+    address: Optional[str] = None
     source: Optional[str] = None
     status: Optional[str] = None
+    priority: Optional[str] = None
+    product_category: Optional[str] = None
+    estimated_value: Optional[Decimal] = None
+    campaign: Optional[str] = None
+    tags: Optional[str] = None
+    next_follow_up: Optional[date] = None
+    last_contacted: Optional[date] = None
     notes: Optional[str] = None
+    owner_id: Optional[int] = None
 
 
 class LeadOut(LeadIn):
     id: int
+    owner_name: str = ""
     created_at: datetime
     updated_at: datetime
 
@@ -68,6 +95,46 @@ class LeadPage(BaseModel):
     page: int
     page_size: int
     status_counts: dict[str, int] = {}
+
+
+class LeadOwnerOption(BaseModel):
+    id: int
+    name: str
+    role: str = ""
+
+
+class LeadMetaOut(BaseModel):
+    owners: list[LeadOwnerOption] = []
+    business_types: list[str] = []
+    sources: list[str] = []
+    statuses: list[str] = []
+    priorities: list[str] = []
+    product_categories: list[str] = []
+    campaigns: list[str] = []
+    tag_suggestions: list[str] = []
+
+
+class LeadStateCountRow(BaseModel):
+    state: str
+    lead_count: int
+
+
+class LeadByStateOut(BaseModel):
+    items: list[LeadStateCountRow]
+    total: int
+
+
+class LeadLanguageCountRow(BaseModel):
+    language: str
+    iso: str
+    label: str
+    lead_count: int
+
+
+class LeadByLanguageOut(BaseModel):
+    items: list[LeadLanguageCountRow]
+    total: int
+    with_language: int = 0
 
 
 class EmployeeIn(BaseModel):
