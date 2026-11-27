@@ -22,6 +22,9 @@ _wake = asyncio.Event()
 # One active paced send pipeline per Evolution instance / agent (parallel across senders).
 _active_sender_keys: set[str] = set()
 _sender_tasks: dict[str, asyncio.Task] = {}
+# Process-local prepared campaign media (base64 + stable public_url) keyed by media_id.
+# Avoids re-reading/re-copying the same ~30MB file for every paced recipient.
+_prepared_media_by_id: dict[int, dict[str, Any]] = {}
 
 PACED_HOURS_ALLOWED = {24, 36, 48}
 MIN_GAP_SECONDS = 45.0
@@ -31,13 +34,64 @@ MIN_PACED_HOURS = 12
 
 IST = ZoneInfo("Asia/Kolkata")
 # Human sleeping hours (India) — no outbound paced sends in this window.
-SLEEP_START = time(23, 45)
-SLEEP_END = time(5, 0)
+SLEEP_START = time(23, 50)
+SLEEP_END = time(5, 50)
 LEADS_MAX_SENDS_PER_IST_DAY = 250
 # Wait for Evolution line to return after a socket flap (see INSTANCE_RECONNECT_*).
 INSTANCE_RECONNECT_MAX_WAIT_SECONDS = 45 * 60
 INSTANCE_RECONNECT_POLL_INITIAL_S = 3.0
 INSTANCE_RECONNECT_POLL_MAX_S = 30.0
+
+
+def daily_send_cap_for_run(run: CampaignRun, day: date | None = None) -> int | None:
+    """Max paced sends allowed on an IST calendar day for this run.
+
+    Resolution order:
+      1. filter_meta.max_sends_by_ist_day["YYYY-MM-DD"] (per-day override, e.g. today=25)
+      2. filter_meta.max_sends_per_ist_day (ongoing daily cap, e.g. 100)
+      3. LEADS_MAX_SENDS_PER_IST_DAY when audience source is leads
+      4. None (no daily cap — dealers / non-leads)
+    """
+    meta = _run_filter_meta(run)
+    day_key = (day or ist_now().date()).isoformat()
+    by_day = meta.get("max_sends_by_ist_day") or meta.get("daily_caps")
+    if isinstance(by_day, dict) and day_key in by_day:
+        try:
+            return max(0, int(by_day[day_key]))
+        except (TypeError, ValueError):
+            pass
+    if meta.get("max_sends_per_ist_day") is not None:
+        try:
+            return max(0, int(meta["max_sends_per_ist_day"]))
+        except (TypeError, ValueError):
+            pass
+    if _is_leads_audience_run(run):
+        return LEADS_MAX_SENDS_PER_IST_DAY
+    return None
+
+
+async def _prepared_campaign_media_for_run(
+    db: Any, media_id: int
+) -> dict[str, Any] | None:
+    """Return cached prepare result for campaign media (stable disk + Evolution base64)."""
+    cached = _prepared_media_by_id.get(media_id)
+    if isinstance(cached, dict) and cached.get("ok"):
+        return cached
+    row = await db.get(CampaignMedia, media_id)
+    if not row:
+        return {"ok": False, "error": f"Campaign media id={media_id} not found"}
+    from app.ai.tools import _prepare_campaign_media_for_send
+
+    prepared = _prepare_campaign_media_for_send(row)
+    if prepared.get("ok"):
+        _prepared_media_by_id[media_id] = prepared
+        # Bound cache: keep at most a handful of large base64 payloads in RAM.
+        if len(_prepared_media_by_id) > 8:
+            for old_id in list(_prepared_media_by_id.keys()):
+                if old_id != media_id:
+                    _prepared_media_by_id.pop(old_id, None)
+                    break
+    return prepared
 
 
 def parse_total_hours(args: dict[str, Any]) -> int | None:
@@ -117,7 +171,7 @@ def _is_leads_audience_run(run: CampaignRun) -> bool:
 
 
 def in_ist_sleep_window(dt: datetime | None = None) -> bool:
-    """True between 23:45 and 05:00 IST (inclusive start, exclusive end at 05:00)."""
+    """True between 23:50 and 05:50 IST (inclusive start, exclusive end at 05:50)."""
     local = (dt or ist_now()).astimezone(IST)
     t = local.time()
     if t >= SLEEP_START:
@@ -132,7 +186,7 @@ def _ist_combine(day, wall: time) -> datetime:
 
 
 def seconds_until_ist_wake(dt: datetime | None = None) -> float:
-    """Seconds until paced sends may resume (05:00 IST)."""
+    """Seconds until paced sends may resume (05:50 IST)."""
     local = (dt or ist_now()).astimezone(IST)
     if not in_ist_sleep_window(local):
         return 0.0
@@ -146,7 +200,7 @@ def seconds_until_ist_wake(dt: datetime | None = None) -> float:
 
 
 def seconds_until_next_ist_day_send_start(dt: datetime | None = None) -> float:
-    """After Leads 250/day cap — wait until 05:00 IST on the next calendar day."""
+    """After daily send cap — wait until 05:50 IST on the next calendar day."""
     local = (dt or ist_now()).astimezone(IST)
     next_day = local.date() + timedelta(days=1)
     start = _ist_combine(next_day, SLEEP_END)
@@ -184,11 +238,13 @@ def count_leads_sent_ist_today(recipients: list[Any]) -> int:
 
 
 def seconds_until_send_allowed(recipients: list[Any], run: CampaignRun) -> float:
-    """Combined wait: sleeping hours + Leads 250/day hard cap."""
+    """Combined wait: sleeping hours + per-run / Leads daily send cap."""
     wake_s = seconds_until_ist_wake()
     if wake_s > 0:
         return wake_s
-    if _is_leads_audience_run(run) and count_leads_sent_ist_today(recipients) >= LEADS_MAX_SENDS_PER_IST_DAY:
+    today = ist_now().date()
+    cap = daily_send_cap_for_run(run, today)
+    if cap is not None and count_leads_sent_on_ist_day(recipients, today) >= cap:
         return seconds_until_next_ist_day_send_start()
     return 0.0
 
@@ -208,8 +264,11 @@ async def _wait_for_sender_instance_connected(db, run: CampaignRun, timeout_s: f
     loop = asyncio.get_running_loop()
     deadline = loop.time() + max(0.0, timeout_s)
     poll_s = INSTANCE_RECONNECT_POLL_INITIAL_S
+    run_id = int(run.id)
     while loop.time() < deadline and not _stop.is_set():
         await db.commit()
+        if not await _run_status_is_active(db, run_id):
+            return False
         if await _sender_instance_connected(db, run):
             return True
         chunk = min(poll_s, max(0.0, deadline - loop.time()))
@@ -223,24 +282,51 @@ async def _wait_for_sender_instance_connected(db, run: CampaignRun, timeout_s: f
     return await _sender_instance_connected(db, run)
 
 
-async def _wait_send_slot(run: CampaignRun, recipients: list[Any]) -> bool:
-    """Block until outside sleep window and under Leads daily cap. False if stop requested."""
-    while not _stop.is_set():
-        wait_s = seconds_until_send_allowed(recipients, run)
-        if wait_s <= 0.5:
-            return True
-        chunk = min(wait_s, 60.0)
-        logger.info(
-            "paced run %s holding %.0fs (IST sleep / leads %s per day)",
-            run.id,
-            wait_s,
-            LEADS_MAX_SENDS_PER_IST_DAY,
-        )
+async def _run_status_is_active(db, run_id: int) -> bool:
+    """True when the paced run should keep sending (not paused/failed/stopped)."""
+    run = await db.get(CampaignRun, run_id)
+    if not run:
+        return False
+    return (run.status or "").strip().lower() in {"queued", "running"}
+
+
+async def _interruptible_sleep(db, run_id: int, timeout_s: float) -> bool:
+    """Sleep up to timeout_s in short chunks. False if global stop or run left active."""
+    remaining = max(0.0, float(timeout_s))
+    while remaining > 0.05 and not _stop.is_set():
+        await db.commit()
+        if not await _run_status_is_active(db, run_id):
+            return False
+        chunk = min(remaining, 15.0)
         try:
             await asyncio.wait_for(_stop.wait(), timeout=chunk)
             return False
         except asyncio.TimeoutError:
-            continue
+            remaining -= chunk
+    return not _stop.is_set() and await _run_status_is_active(db, run_id)
+
+
+async def _wait_send_slot(db, run: CampaignRun, recipients: list[Any]) -> bool:
+    """Block until outside sleep window and under daily send cap. False if stop/pause."""
+    run_id = int(run.id)
+    while not _stop.is_set():
+        await db.commit()
+        fresh = await db.get(CampaignRun, run_id)
+        if not fresh or (fresh.status or "").strip().lower() not in {"queued", "running"}:
+            return False
+        wait_s = seconds_until_send_allowed(recipients, fresh)
+        if wait_s <= 0.5:
+            return True
+        chunk = min(wait_s, 60.0)
+        cap = daily_send_cap_for_run(fresh)
+        logger.info(
+            "paced run %s holding %.0fs (IST sleep / daily cap %s)",
+            run_id,
+            wait_s,
+            cap if cap is not None else "none",
+        )
+        if not await _interruptible_sleep(db, run_id, chunk):
+            return False
     return False
 
 
@@ -292,15 +378,16 @@ def _seconds_until_send_allowed_at(
     dt: datetime,
     simulated_by_day: dict[date, int] | None = None,
 ) -> float:
-    """IST sleep + Leads 250/day wait from dt (optional projected sends per IST day)."""
+    """IST sleep + daily send-cap wait from dt (optional projected sends per IST day)."""
     local = dt.astimezone(IST)
     wake_s = seconds_until_ist_wake(local)
     if wake_s > 0:
         return wake_s
-    if _is_leads_audience_run(run):
-        day = local.date()
+    day = local.date()
+    cap = daily_send_cap_for_run(run, day)
+    if cap is not None:
         sim = (simulated_by_day or {}).get(day, 0)
-        if count_leads_sent_on_ist_day(recipients, day) + sim >= LEADS_MAX_SENDS_PER_IST_DAY:
+        if count_leads_sent_on_ist_day(recipients, day) + sim >= cap:
             return seconds_until_next_ist_day_send_start(local)
     return 0.0
 
@@ -347,7 +434,7 @@ def estimate_paced_run_end_at(run: CampaignRun) -> datetime | None:
                 break
             t = t + timedelta(seconds=wait_s)
 
-        if _is_leads_audience_run(run):
+        if daily_send_cap_for_run(run, t.astimezone(IST).date()) is not None:
             day = t.astimezone(IST).date()
             simulated_by_day[day] = simulated_by_day.get(day, 0) + 1
 
@@ -514,6 +601,97 @@ def wake_paced_worker() -> None:
 _KEEP_STATUSES = frozenset({"sent", "skipped"})
 # Campaign Report statuses eligible for Restart / Resume-on-new-instance.
 RESUMABLE_RUN_STATUSES = frozenset({"failed", "stopped"})
+# Operator Pause / Resume (continue) — keeps next_index, counts, caps, gaps intact.
+PAUSABLE_RUN_STATUSES = frozenset({"running", "queued"})
+UNPAUSABLE_RUN_STATUSES = frozenset({"paused"})
+
+
+async def pause_paced_campaign_run(db, run: CampaignRun, *, user: User | None = None) -> dict[str, Any]:
+    """Stop further paced sends without losing recipient progress or rate caps.
+
+    Does not reset next_index / success / failed / skipped, filter_meta daily caps,
+    quiet-hours rules, or gaps_json. Other campaigns are untouched.
+    """
+    _ = user
+    status = (run.status or "").strip().lower()
+    if status not in PAUSABLE_RUN_STATUSES:
+        raise ValueError(
+            f"Campaign is {status or 'unknown'} — only Running/Queued campaigns can be paused"
+        )
+    run.status = "paused"
+    run.finished_at = None
+    run.note = (
+        f"Paused by operator at {int(run.next_index or 0)}/{int(run.total_count or 0)} "
+        f"({int(run.success_count or 0)} sent, {int(run.failed_count or 0)} failed, "
+        f"{int(run.skipped_count or 0)} skipped). Resume to continue; Est. end will reschedule."
+    )[:4000]
+    await db.flush()
+    return {
+        "ok": True,
+        "run_id": int(run.id),
+        "uid": int(run.uid) if run.uid is not None else None,
+        "status": run.status,
+        "next_index": int(run.next_index or 0),
+        "total_count": int(run.total_count or 0),
+        "success_count": int(run.success_count or 0),
+        "failed_count": int(run.failed_count or 0),
+        "skipped_count": int(run.skipped_count or 0),
+        "note": run.note,
+    }
+
+
+async def unpause_paced_campaign_run(db, run: CampaignRun, *, user: User | None = None) -> dict[str, Any]:
+    """Continue a paused paced run from next_index (same caps / gaps / instance).
+
+    Does not rebuild recipients or change messages-per-day overrides. Est. end is
+    recomputed by estimate_paced_run_end_at once status is running again.
+    """
+    _ = user
+    status = (run.status or "").strip().lower()
+    if status not in UNPAUSABLE_RUN_STATUSES:
+        raise ValueError(
+            f"Campaign is {status or 'unknown'} — only Paused campaigns can be resumed"
+        )
+    recipients_raw = _parse_run_recipients(run)
+    if not recipients_raw:
+        raise ValueError("Campaign has no recipient queue to resume")
+    pending = max(
+        0,
+        int(run.total_count or 0)
+        - int(run.success_count or 0)
+        - int(run.failed_count or 0)
+        - int(run.skipped_count or 0),
+    )
+    if pending <= 0 and int(run.next_index or 0) >= len(recipients_raw):
+        raise ValueError("Nothing left to send — campaign already finished")
+
+    if int(run.total_hours or 0) < MIN_PACED_HOURS:
+        run.total_hours = 24
+
+    run.status = "running"
+    run.finished_at = None
+    run.started_at = run.started_at or _now()
+    hours = int(run.total_hours or 24)
+    run.note = (
+        f"Resumed from pause at {int(run.next_index or 0)}/{int(run.total_count or 0)} "
+        f"(~{pending} remaining). Same daily cap / quiet hours / interval; "
+        f"paced {hours}h — Est. end rescheduled from now."
+    )[:4000]
+    await db.flush()
+    return {
+        "ok": True,
+        "run_id": int(run.id),
+        "uid": int(run.uid) if run.uid is not None else None,
+        "status": run.status,
+        "next_index": int(run.next_index or 0),
+        "total_count": int(run.total_count or 0),
+        "success_count": int(run.success_count or 0),
+        "failed_count": int(run.failed_count or 0),
+        "skipped_count": int(run.skipped_count or 0),
+        "pending_count": pending,
+        "total_hours": hours,
+        "note": run.note,
+    }
 
 
 def prepare_recipients_for_resume(
@@ -701,7 +879,13 @@ async def _process_one_run(run_id: int) -> bool:
             await db.commit()
             return False
 
-        if not await _wait_send_slot(run, recipients):
+        if not await _wait_send_slot(db, run, recipients):
+            await db.commit()
+            return False
+
+        # Re-check after wait — operator may have paused while we held the slot.
+        await db.refresh(run)
+        if (run.status or "") not in {"queued", "running"}:
             await db.commit()
             return False
 
@@ -766,11 +950,7 @@ async def _process_one_run(run_id: int) -> bool:
                 await db.commit()
                 return False
             gap_s = runtime_gap_seconds(run, idx)
-            try:
-                await asyncio.wait_for(_stop.wait(), timeout=gap_s)
-                return False
-            except asyncio.TimeoutError:
-                return True
+            return await _interruptible_sleep(db, run_id, gap_s)
 
         if phone:
             from app.ai.whatsapp_send_guards import phone_marked_spam
@@ -805,6 +985,14 @@ async def _process_one_run(run_id: int) -> bool:
             "confirm_send": True,
             "dry_run": False,
         }
+        # Reuse one prepared payload (stable wa-media path + base64) for the whole
+        # paced run. Without this, each recipient re-copied ~30MB into wa_media.
+        if run.media_id is not None:
+            prepared = await _prepared_campaign_media_for_run(db, int(run.media_id))
+            if prepared and prepared.get("ok"):
+                one_args["_prepared_media"] = prepared
+            elif prepared and not prepared.get("ok"):
+                one_args["_prepared_media"] = prepared  # surface error via send path
         # Evolution send_media already retries WA CDN 503; keep a short paced-level
         # retry so a single blip does not burn a recipient slot.
         from app.evolution_service import is_transient_media_upload_error
@@ -1000,7 +1188,7 @@ async def _process_one_run(run_id: int) -> bool:
 
         await db.commit()
 
-        # Sleep with random human-like jitter before next send (outside transaction)
+        # Sleep with random human-like jitter before next send (honors Pause mid-gap).
         gap_s = runtime_gap_seconds(run, idx)
         logger.info(
             "paced run %s sent idx=%s/%s; sleeping %.0fs",
@@ -1009,11 +1197,7 @@ async def _process_one_run(run_id: int) -> bool:
             len(recipients),
             gap_s,
         )
-        try:
-            await asyncio.wait_for(_stop.wait(), timeout=gap_s)
-            return False  # stop requested
-        except asyncio.TimeoutError:
-            return True
+        return await _interruptible_sleep(db, run_id, gap_s)
 
 
 def _sender_key(run: CampaignRun) -> str:

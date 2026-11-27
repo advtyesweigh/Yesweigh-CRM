@@ -74,8 +74,50 @@ def resolve_state_match(raw: str) -> tuple[str, list[str]]:
     return cleaned, [cleaned]
 
 
+def _phone_last10(raw: str | None) -> str:
+    """Last-10 Indian mobile digits for matching (same idea as WhatsApp phone_key)."""
+    digits = re.sub(r"\D+", "", raw or "")
+    if digits.startswith("91") and len(digits) > 10:
+        digits = digits[2:]
+    if len(digits) >= 10:
+        return digits[-10:]
+    return digits
+
+
+def normalize_phone_list(raw: Any) -> list[str]:
+    """Parse phones from list / pipe|comma string → unique 91XXXXXXXXXX-ish strings preserving input digits."""
+    values: list[str] = []
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple, set)):
+        for item in raw:
+            s = str(item or "").strip()
+            if s:
+                values.extend(re.split(r"\s*[|,;\s]\s*", s))
+    else:
+        s = str(raw).strip()
+        if s:
+            values.extend(re.split(r"\s*[|,;\s]\s*", s))
+    out: list[str] = []
+    seen: set[str] = set()
+    for v in values:
+        digits = re.sub(r"\D+", "", v or "")
+        if not digits:
+            continue
+        key = _phone_last10(digits)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        # Prefer full 91+10 when we have it; else keep digits as-is
+        if len(digits) == 10 and digits[0] in "6789":
+            out.append(f"91{digits}")
+        else:
+            out.append(digits)
+    return out
+
+
 def normalize_filters(raw: dict[str, Any] | str | None) -> dict[str, str]:
-    """Normalize filter payload to {state, city, district} strings (extensible)."""
+    """Normalize filter payload to {state, city, district, phones} strings (extensible)."""
     data: dict[str, Any] = {}
     if isinstance(raw, str):
         try:
@@ -93,13 +135,20 @@ def normalize_filters(raw: dict[str, Any] | str | None) -> dict[str, str]:
                 continue
             field = str(rule.get("field") or "").strip().lower()
             value = str(rule.get("value") or rule.get("eq") or "").strip()
-            if field in {"state", "city", "district"} and value:
-                data[field] = value
+            if field in {"state", "city", "district", "phones", "phone"} and value:
+                data["phones" if field == "phone" else field] = value
     out: dict[str, str] = {}
     for key in ("state", "city", "district"):
         val = str(data.get(key) or "").strip()
         if val:
             out[key] = val
+    # Static / manual member list by phone (pipe-joined). Survives geo filters when both set.
+    phones_raw = data.get("phones")
+    if phones_raw is None:
+        phones_raw = data.get("phone")
+    phones = normalize_phone_list(phones_raw)
+    if phones:
+        out["phones"] = "|".join(phones)
     return out
 
 
@@ -114,7 +163,22 @@ def filter_summary(filters: dict[str, str]) -> str:
     for key in ("state", "city", "district"):
         if filters.get(key):
             parts.append(f"{key}={filters[key]}")
+    phones = normalize_phone_list(filters.get("phones"))
+    if phones:
+        parts.append(f"phones={len(phones)}")
     return ", ".join(parts) if parts else "All (no filters)"
+
+
+def _phone_match_clauses(col_phone: Any, phones: list[str]) -> list[Any]:
+    """SQL clauses: stored phone ends with last-10 of each listed number."""
+    clauses: list[Any] = []
+    for p in phones:
+        key = _phone_last10(p)
+        if not key:
+            continue
+        # Match …9947550783 / 919947550783 / +91-9947…
+        clauses.append(col_phone.ilike(f"%{key}"))
+    return clauses
 
 
 def normalize_source(raw: str | None) -> AudienceSource:
@@ -178,6 +242,20 @@ class AudiencePreviewOut(BaseModel):
     with_phone: int
     items: list[AudienceMemberOut]
     truncated: bool = False
+
+
+def _dedupe_members_by_phone(items: list[AudienceMemberOut]) -> list[AudienceMemberOut]:
+    """Keep one member per last-10 phone (static phone audiences are phone-unique)."""
+    out: list[AudienceMemberOut] = []
+    seen: set[str] = set()
+    for item in items:
+        key = _phone_last10(item.phone)
+        if key:
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(item)
+    return out
 
 
 def fmt_audience_uid(uid: int | None) -> str:
@@ -282,9 +360,40 @@ def _apply_geo_filters(q: Any, *, col_state: Any, col_city: Any, col_district: A
     return q
 
 
+def _apply_phone_filter(q: Any, *, col_phone: Any, filters: dict[str, str]) -> Any:
+    phones = normalize_phone_list(filters.get("phones"))
+    if not phones:
+        return q
+    clauses = _phone_match_clauses(col_phone, phones)
+    if not clauses:
+        # Explicit empty phone list → match nothing
+        return q.where(col_phone == "__no_phone_match__")
+    return q.where(or_(*clauses))
+
+
 async def count_audience_members(db: AsyncSession, row: CustomAudience) -> int:
     filters = normalize_filters(row.filters_json)
     source = (row.source or "dealers").strip().lower()
+    phones = normalize_phone_list(filters.get("phones"))
+    # Phone-list audiences: count unique phones that match (CRM may have duplicate dealer rows).
+    if phones:
+        if source == "leads":
+            q = select(Lead.phone)
+            q = _apply_geo_filters(
+                q, col_state=Lead.state, col_city=Lead.city, col_district=Lead.district, filters=filters
+            )
+            q = _apply_phone_filter(q, col_phone=Lead.phone, filters=filters)
+            rows = (await db.execute(q)).scalars().all()
+        else:
+            visible = dealer_not_excluded_clause(Dealer.name, Dealer.company, Dealer.zoho_contact_id)
+            q = select(Dealer.phone).where(visible)
+            q = _apply_geo_filters(
+                q, col_state=Dealer.state, col_city=Dealer.city, col_district=None, filters=filters
+            )
+            q = _apply_phone_filter(q, col_phone=Dealer.phone, filters=filters)
+            rows = (await db.execute(q)).scalars().all()
+        return len({k for k in (_phone_last10(p) for p in rows) if k})
+
     if source == "leads":
         q = select(func.count()).select_from(Lead)
         q = _apply_geo_filters(q, col_state=Lead.state, col_city=Lead.city, col_district=Lead.district, filters=filters)
@@ -310,13 +419,43 @@ async def resolve_audience_members(
     limit = max(1, min(1500, int(limit)))
     offset = max(0, int(offset))
 
+    phone_list = normalize_phone_list(filters.get("phones"))
+    # For phone-list audiences, fetch enough rows to dedupe, then paginate in memory.
+    fetch_limit = max(limit + offset, len(phone_list) * 4 if phone_list else limit) if phone_list else limit
+    fetch_limit = max(1, min(5000, int(fetch_limit)))
+
     if source == "leads":
         base = select(Lead)
         base = _apply_geo_filters(
             base, col_state=Lead.state, col_city=Lead.city, col_district=Lead.district, filters=filters
         )
+        base = _apply_phone_filter(base, col_phone=Lead.phone, filters=filters)
         if with_phone_only:
             base = base.where(Lead.phone != "", Lead.phone.is_not(None))
+        if phone_list:
+            rows = list(
+                (await db.execute(base.order_by(Lead.name.asc(), Lead.company.asc()).limit(fetch_limit)))
+                .scalars()
+                .all()
+            )
+            items_all = _dedupe_members_by_phone(
+                [
+                    AudienceMemberOut(
+                        id=r.id,
+                        name=(r.name or r.company or "").strip() or f"Lead #{r.id}",
+                        phone=(r.phone or "").strip(),
+                        company=(r.company or "").strip(),
+                        city=(r.city or "").strip(),
+                        district=(r.district or "").strip(),
+                        state=(r.state or "").strip(),
+                    )
+                    for r in rows
+                ]
+            )
+            total = len(items_all)
+            with_phone = sum(1 for i in items_all if (i.phone or "").strip())
+            items = items_all[offset : offset + limit]
+            return items, total, with_phone
         total = int(
             (await db.execute(select(func.count()).select_from(base.subquery()))).scalar() or 0
         )
@@ -352,8 +491,37 @@ async def resolve_audience_members(
     base = _apply_geo_filters(
         base, col_state=Dealer.state, col_city=Dealer.city, col_district=None, filters=filters
     )
+    base = _apply_phone_filter(base, col_phone=Dealer.phone, filters=filters)
     if with_phone_only:
         base = base.where(Dealer.phone != "", Dealer.phone.is_not(None))
+    if phone_list:
+        rows = list(
+            (
+                await db.execute(
+                    base.order_by(Dealer.name.asc(), Dealer.company.asc()).limit(fetch_limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        items_all = _dedupe_members_by_phone(
+            [
+                AudienceMemberOut(
+                    id=r.id,
+                    name=(r.company or r.name or "").strip() or f"Dealer #{r.id}",
+                    phone=(r.phone or "").strip(),
+                    company=(r.company or "").strip(),
+                    city=(r.city or "").strip(),
+                    district="",
+                    state=(r.state or "").strip(),
+                )
+                for r in rows
+            ]
+        )
+        total = len(items_all)
+        with_phone = sum(1 for i in items_all if (i.phone or "").strip())
+        items = items_all[offset : offset + limit]
+        return items, total, with_phone
     total = int((await db.execute(select(func.count()).select_from(base.subquery()))).scalar() or 0)
     phone_q = base.where(Dealer.phone != "", Dealer.phone.is_not(None))
     with_phone = int(

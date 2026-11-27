@@ -517,6 +517,8 @@ def _run_out(row: CampaignRun, media_row: CampaignMedia | None = None) -> Campai
     uid_int = int(uid_val) if uid_val is not None else None
     status_l = status.strip().lower()
     can_restart = status_l in {"failed", "stopped"}
+    can_pause = status_l in {"running", "queued"}
+    can_unpause = status_l == "paused"
     return CampaignRunOut(
         id=row.id,
         uid=uid_int,
@@ -543,6 +545,8 @@ def _run_out(row: CampaignRun, media_row: CampaignMedia | None = None) -> Campai
         created_at=row.created_at.isoformat() if row.created_at else "",
         estimated_end_at=estimated_end_at,
         can_restart=can_restart,
+        can_pause=can_pause,
+        can_unpause=can_unpause,
     )
 
 
@@ -657,6 +661,8 @@ class CampaignRunOut(BaseModel):
     created_at: str = ""
     estimated_end_at: str = ""
     can_restart: bool = False
+    can_pause: bool = False
+    can_unpause: bool = False
 
 
 class CampaignResumeIn(BaseModel):
@@ -1274,6 +1280,49 @@ async def list_campaign_send_instances(db: Db, user: CurrentUser):
     """Connected Evolution lines available for Resume-on-new-instance (Campaigns ACL)."""
     rows = await _authorized_send_instances(db, user)
     return [_send_instance_out(r) for r in rows]
+
+
+@router.post("/runs/{run_id}/pause", response_model=CampaignRunOut)
+async def pause_campaign_run(run_id: int, db: Db, user: CurrentUser):
+    """Pause a Running/Queued paced blast. Keeps next_index, counts, and daily caps.
+
+    Does not touch other campaigns. Resume via /unpause to continue and reschedule Est. end.
+    """
+    from app.paced_media_batch import pause_paced_campaign_run
+
+    run = await db.get(CampaignRun, run_id)
+    if not run:
+        raise HTTPException(404, "Campaign run not found")
+    try:
+        await pause_paced_campaign_run(db, run, user=user)
+        await db.commit()
+        await db.refresh(run)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    media_row = await db.get(CampaignMedia, run.media_id) if run.media_id else None
+    return _run_out(run, media_row)
+
+
+@router.post("/runs/{run_id}/unpause", response_model=CampaignRunOut)
+async def unpause_campaign_run(run_id: int, db: Db, user: CurrentUser):
+    """Resume a Paused paced blast from where it left off (same instance / caps / gaps).
+
+    Est. end is recomputed from remaining recipients + daily cap + quiet hours + interval model.
+    """
+    from app.paced_media_batch import unpause_paced_campaign_run, wake_paced_worker
+
+    run = await db.get(CampaignRun, run_id)
+    if not run:
+        raise HTTPException(404, "Campaign run not found")
+    try:
+        await unpause_paced_campaign_run(db, run, user=user)
+        await db.commit()
+        await db.refresh(run)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    wake_paced_worker()
+    media_row = await db.get(CampaignMedia, run.media_id) if run.media_id else None
+    return _run_out(run, media_row)
 
 
 @router.post("/runs/{run_id}/restart", response_model=CampaignRunOut)

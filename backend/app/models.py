@@ -1474,7 +1474,7 @@ class CampaignRun(Base):
     note: Mapped[str] = mapped_column(Text, default="")
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    # Paced sends (24h/48h background worker): completed|running|queued|failed|stopped
+    # Paced sends (24h/48h background worker): completed|running|queued|paused|failed|stopped
     status: Mapped[str] = mapped_column(String(40), default="completed", index=True)
     total_hours: Mapped[int] = mapped_column(Integer, default=0)
     next_index: Mapped[int] = mapped_column(Integer, default=0)
@@ -1488,7 +1488,7 @@ class CampaignRun(Base):
 
 
 class CustomAudience(Base):
-    """Dynamic custom audience — filters resolve dealers/leads at read time (not a frozen snapshot)."""
+    """Custom audience — geo filters and/or static phone lists resolve at read time."""
 
     __tablename__ = "custom_audiences"
 
@@ -1499,7 +1499,7 @@ class CustomAudience(Base):
     # dealers | leads — maps to CRM left-menu Dealer / Leads
     source: Mapped[str] = mapped_column(String(40), default="dealers", index=True)
     description: Mapped[str] = mapped_column(Text, default="")
-    # JSON object, e.g. {"state":"Kerala","city":"","district":""} — extensible
+    # JSON: {"state":"Keralam"} and/or {"phones":"91…|91…"} for static lists — extensible
     filters_json: Mapped[str] = mapped_column(Text, default="{}")
     # Cached display count from last resolve (live count still computed on read)
     last_count: Mapped[int | None] = mapped_column(Integer, nullable=True)

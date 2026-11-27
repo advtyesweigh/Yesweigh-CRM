@@ -5598,11 +5598,17 @@ async def _resolve_campaign_media_row(
 
 
 def _prepare_campaign_media_for_send(row: CampaignMedia) -> dict[str, Any]:
-    """Load campaign file once → wa-media copy + Evolution base64 payload."""
+    """Load campaign library file once → stable wa-media link/copy + Evolution base64.
+
+    Prefer one on-disk wa-media file keyed by campaign UID (fallback: media id).
+    Do not call save_bytes (UUID-per-write) — paced campaigns were creating
+    ~N copies of the same video (e.g. UID 1000 / 30MB × 1300+ ≈ 40GB).
+    Canonical bytes stay in /data/campaign-media; wa-media holds at most one stable alias.
+    """
     import base64
 
     from app.campaigns import _media_kind_of, _media_path
-    from app.media_store import save_bytes
+    from app.media_store import ensure_stable_from_path
 
     path = _media_path(row)
     if not path:
@@ -5623,14 +5629,24 @@ def _prepare_campaign_media_for_send(row: CampaignMedia) -> dict[str, Any]:
     kind = _media_kind_of(row)
     if kind not in {"video", "image", "document"}:
         kind = "document"
-    raw = path.read_bytes()
     filename = (row.file_name or path.name or f"media-{row.id}").strip() or f"media-{row.id}"
-    public_url, _stored = save_bytes(raw, media_type=kind, filename=filename)
+    uid_val = getattr(row, "uid", None)
+    # Prefer public UID so all campaigns sharing the same library UID reuse one file.
+    if uid_val is not None:
+        stem = f"campaign_uid_{int(uid_val)}"
+    else:
+        stem = f"campaign_media_{int(row.id)}"
+    public_url, _stored = ensure_stable_from_path(
+        path,
+        stem=stem,
+        media_type=kind,
+        filename=filename,
+    )
+    raw = path.read_bytes()
     evo_b64 = base64.b64encode(raw).decode("ascii")
     title = (row.title or filename).strip()
     # Stable dedupe marker in media_name
     media_name = f"campaign_media:{row.id}:{filename}"[:240]
-    uid_val = getattr(row, "uid", None)
     return {
         "ok": True,
         "media_id": row.id,

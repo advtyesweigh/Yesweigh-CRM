@@ -1,0 +1,903 @@
+{
+  "count": 53,
+  "with_phone": 53,
+  "dealers": [
+    {
+      "dealer": "MEEZAN ELECTRONIC SCALES PRIVATE LIMITED",
+      "company": "MEEZAN ELECTRONIC SCALES PRIVATE LIMITED",
+      "city": "Manjeri",
+      "state": "Keralam",
+      "phone": "919446157730",
+      "email": "purchase@meezanscale.com",
+      "qty": 144.0,
+      "amount": 1569657.03,
+      "line_count": 46,
+      "items": [
+        "ECS 12  4W Printing scale",
+        "ECS Additional Sales",
+        "ECS with Printer",
+        "ELECTRONIC CASH REGISTER",
+        "ELECTRONIC CASH REGISTER (BLACK)",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000112170",
+      "dealer_id": 573
+    },
+    {
+      "dealer": "ACCURATE TRADE LINKS",
+      "company": "ACCURATE TRADE LINKS",
+      "city": "Trivandrum",
+      "state": "Keralam",
+      "phone": "919847141007",
+      "email": "accuratetradelink@gmail.com",
+      "qty": 127.0,
+      "amount": 1515800.0,
+      "line_count": 22,
+      "items": [
+        "ECS 12  4W Printing scale",
+        "ECS with Printer",
+        "ELECTRONIC CASH REGISTER (BLACK)",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000114383",
+      "dealer_id": 26
+    },
+    {
+      "dealer": "ACE ELECTRONICS",
+      "company": "ACE ELECTRONICS",
+      "city": "Calicut",
+      "state": "Keralam",
+      "phone": "919495977173",
+      "email": "thrassindiaho@gmail.com",
+      "qty": 123.0,
+      "amount": 1444481.1,
+      "line_count": 28,
+      "items": [
+        "ECS with Printer",
+        "ELECTRONIC CASH REGISTER",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000084508",
+      "dealer_id": 31
+    },
+    {
+      "dealer": "TRANSWORLD SCALES SERVICES",
+      "company": "TRANSWORLD SCALES  SERVICES",
+      "city": "Kollam",
+      "state": "Keralam",
+      "phone": "919446332381",
+      "email": "",
+      "qty": 77.0,
+      "amount": 1023600.0,
+      "line_count": 18,
+      "items": [
+        "ECS 12  4W Printing scale",
+        "ECS with Printer",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000102001",
+      "dealer_id": 1051
+    },
+    {
+      "dealer": "KRAUS INSTRUMENTS",
+      "company": "KRAUS INSTRUMENTS",
+      "city": "KOKKALAI, THRISSUR",
+      "state": "Keralam",
+      "phone": "919961702031",
+      "email": "asishpulikkottil@gmail.com",
+      "qty": 76.0,
+      "amount": 835950.0,
+      "line_count": 22,
+      "items": [
+        "ECS 12  4W Printing scale",
+        "ECS 12 4W Printing scale",
+        "ECS with Printer",
+        "ELECTRONIC CASH REGISTER (BLACK)",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000309611",
+      "dealer_id": 453
+    },
+    {
+      "dealer": "DYNAMIC ENTERPRISES",
+      "company": "DYNAMIC ENTERPRISES",
+      "city": "THRISSUR",
+      "state": "Keralam",
+      "phone": "919447772713",
+      "email": "",
+      "qty": 65.0,
+      "amount": 693200.0,
+      "line_count": 14,
+      "items": [
+        "ECS 12  4W Printing scale",
+        "ECS 12 4W Printing scale",
+        "ECS with Printer",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000151001",
+      "dealer_id": 1923
+    },
+    {
+      "dealer": "ELMASS SYSTEMS & SERVICES",
+      "company": "ELMASS SYSTEMS & SERVICES",
+      "city": "Ernakulam",
+      "state": "Keralam",
+      "phone": "919846036922",
+      "email": "info@elmassweighing.com",
+      "qty": 48.0,
+      "amount": 548283.52,
+      "line_count": 10,
+      "items": [
+        "ECS 12  4W Printing scale",
+        "ECS with Printer",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000084733",
+      "dealer_id": 1918
+    },
+    {
+      "dealer": "UNITECH WEIGHING SYSTEM",
+      "company": "UNITECH WEIGHING SYSTEM",
+      "city": "Kottayam",
+      "state": "Keralam",
+      "phone": "919947550783",
+      "email": "initech2@gmail.com",
+      "qty": 40.0,
+      "amount": 579400.0,
+      "line_count": 20,
+      "items": [
+        "ECS with Printer",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000064003",
+      "dealer_id": 1070
+    },
+    {
+      "dealer": "TAKYON SYSTEMS",
+      "company": "TAKYON SYSTEMS",
+      "city": "Kollam",
+      "state": "Keralam",
+      "phone": "919383450884",
+      "email": "",
+      "qty": 40.0,
+      "amount": 472750.0,
+      "line_count": 12,
+      "items": [
+        "ECS with Printer",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000154574",
+      "dealer_id": 1022
+    },
+    {
+      "dealer": "Victory Scales",
+      "company": "Victory Scales",
+      "city": "Kottayam,",
+      "state": "Keralam",
+      "phone": "919447165493",
+      "email": "babumt1966@gmail.com",
+      "qty": 34.0,
+      "amount": 415500.0,
+      "line_count": 7,
+      "items": [
+        "ECS 12  4W Printing scale",
+        "ECS with Printer",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000231096",
+      "dealer_id": 1108
+    },
+    {
+      "dealer": "ASK AUTOMATION SYSTEM",
+      "company": "ASK AUTOMATION SYSTEM",
+      "city": "CHALAKUDY",
+      "state": "Keralam",
+      "phone": "919447772713",
+      "email": "",
+      "qty": 25.0,
+      "amount": 238750.0,
+      "line_count": 3,
+      "items": [
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000271001",
+      "dealer_id": 1927
+    },
+    {
+      "dealer": "TRAVANCORE SCALES SERVICES",
+      "company": "TRAVANCORE SCALES SERVICES",
+      "city": "Tiruvanntapuram",
+      "state": "Keralam",
+      "phone": "919995111501",
+      "email": "dileepnair8@gmail.com",
+      "qty": 23.0,
+      "amount": 266300.0,
+      "line_count": 10,
+      "items": [
+        "ECS with Printer",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000036062",
+      "dealer_id": 1053
+    },
+    {
+      "dealer": "VIRTUE SYSTEM & TECHNOLOGIES",
+      "company": "VIRTUE SYSTEM & TECHNOLOGIES",
+      "city": "Cochin",
+      "state": "Keralam",
+      "phone": "918129216679",
+      "email": "virtuesystems09@gmail.com",
+      "qty": 20.0,
+      "amount": 233400.0,
+      "line_count": 13,
+      "items": [
+        "ECS with Printer",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000406011",
+      "dealer_id": 1930
+    },
+    {
+      "dealer": "YESWEIGH TECHNOLOGIES PRIVATE LIMITED",
+      "company": "YESWEIGH TECHNOLOGIES PRIVATE LIMITED",
+      "city": "kannur",
+      "state": "Keralam",
+      "phone": "919804333555",
+      "email": "admin@yesweighing.com",
+      "qty": 19.0,
+      "amount": 225300.0,
+      "line_count": 6,
+      "items": [
+        "ECS with Printer",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000575003",
+      "dealer_id": 1896
+    },
+    {
+      "dealer": "SOUTHERN SCALE SERVICES",
+      "company": "SOUTHERN SCALE SERVICES",
+      "city": "ENGLISH CHURCH ROAD, PALAKKAD",
+      "state": "Keralam",
+      "phone": "919895075360",
+      "email": "metroscales@gmail.com",
+      "qty": 12.0,
+      "amount": 174000.0,
+      "line_count": 6,
+      "items": [
+        "ECS with Printer"
+      ],
+      "customer_id": "99381000000014010",
+      "dealer_id": 932
+    },
+    {
+      "dealer": "ALUVA SCALES INC",
+      "company": "ALUVA SCALES INC",
+      "city": "Aluva",
+      "state": "Keralam",
+      "phone": "919846145868",
+      "email": "",
+      "qty": 12.0,
+      "amount": 155000.0,
+      "line_count": 3,
+      "items": [
+        "ECS 12 4W Printing scale",
+        "ECS with Printer"
+      ],
+      "customer_id": "99381000000014794",
+      "dealer_id": 61
+    },
+    {
+      "dealer": "YESWEIGH SOLUTIONS LLP",
+      "company": "YESWEIGH SOLUTIONS LLP",
+      "city": "Kasargod",
+      "state": "Keralam",
+      "phone": "917034014130",
+      "email": "santhosh@yeweighing.com",
+      "qty": 11.0,
+      "amount": 123100.0,
+      "line_count": 11,
+      "items": [
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000003493071",
+      "dealer_id": 1895
+    },
+    {
+      "dealer": "YELLOW SCALES",
+      "company": "YELLOW SCALES",
+      "city": "KOCHIN",
+      "state": "Keralam",
+      "phone": "919447291424",
+      "email": "",
+      "qty": 10.0,
+      "amount": 120200.0,
+      "line_count": 7,
+      "items": [
+        "ECS with Printer",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000126001",
+      "dealer_id": 1921
+    },
+    {
+      "dealer": "METRO ENTERPRISES",
+      "company": "METRO ENTERPRISES",
+      "city": "Palakkad",
+      "state": "Keralam",
+      "phone": "919447922223",
+      "email": "ratheeshmkd@gmail.com",
+      "qty": 9.0,
+      "amount": 117700.0,
+      "line_count": 5,
+      "items": [
+        "ECS 12  4W Printing scale",
+        "ECS with Printer",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000011771",
+      "dealer_id": 581
+    },
+    {
+      "dealer": "YELLOW SCALES & SYSTEMS",
+      "company": "Yellow Scales & Systems",
+      "city": "KOCHI",
+      "state": "Keralam",
+      "phone": "919447291424",
+      "email": "",
+      "qty": 9.0,
+      "amount": 68450.0,
+      "line_count": 8,
+      "items": [
+        "ELECTRONIC CASH REGISTER",
+        "ELECTRONIC CASH REGISTER (BLACK)",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000019924810",
+      "dealer_id": 1144
+    },
+    {
+      "dealer": "MASS TECHNOLOGY",
+      "company": "MASS TECHNOLOGY",
+      "city": "KOYILANDY",
+      "state": "Keralam",
+      "phone": "919349388806",
+      "email": "masskoyilandy@gmail.com",
+      "qty": 8.0,
+      "amount": 87600.0,
+      "line_count": 5,
+      "items": [
+        "ECS Additional Sales",
+        "ECS with Printer",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000014461",
+      "dealer_id": 557
+    },
+    {
+      "dealer": "TRAAS TECH",
+      "company": "TRAAS TECH",
+      "city": "Kannur",
+      "state": "Keralam",
+      "phone": "919847460630",
+      "email": "traastech@gmail.com",
+      "qty": 7.0,
+      "amount": 96000.0,
+      "line_count": 4,
+      "items": [
+        "ECS with Printer",
+        "ELECTRONIC CASH REGISTER (BLACK)"
+      ],
+      "customer_id": "99381000000364094",
+      "dealer_id": 1928
+    },
+    {
+      "dealer": "ROYAL SCALES",
+      "company": "ROYAL SCALES",
+      "city": "Kannur",
+      "state": "Keralam",
+      "phone": "919895339647",
+      "email": "",
+      "qty": 7.0,
+      "amount": 72500.0,
+      "line_count": 7,
+      "items": [
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000002549012",
+      "dealer_id": 762
+    },
+    {
+      "dealer": "DIGITAL SCALE",
+      "company": "DIGITAL SCALE",
+      "city": "Malappuram",
+      "state": "Keralam",
+      "phone": "919745204910",
+      "email": "nisareranikunnu0@gmail.com",
+      "qty": 6.0,
+      "amount": 79000.0,
+      "line_count": 3,
+      "items": [
+        "ECS with Printer",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000136578",
+      "dealer_id": 1922
+    },
+    {
+      "dealer": "ADCO DIGITAL SYSTEMS",
+      "company": "ADCO DIGITAL SYSTEMS",
+      "city": "Malappuram",
+      "state": "Keralam",
+      "phone": "919447171099",
+      "email": "adcodigitalsystems@gmail.com",
+      "qty": 6.0,
+      "amount": 58200.0,
+      "line_count": 2,
+      "items": [
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000001417879",
+      "dealer_id": 34
+    },
+    {
+      "dealer": "LULU SCALES CALICUT",
+      "company": "LULU SCALES CALICUT",
+      "city": "Kozhikode",
+      "state": "Keralam",
+      "phone": "919656488821",
+      "email": "luluscalesclt@gmail.com",
+      "qty": 5.0,
+      "amount": 72500.0,
+      "line_count": 1,
+      "items": [
+        "ECS with Printer"
+      ],
+      "customer_id": "99381000000014557",
+      "dealer_id": 481
+    },
+    {
+      "dealer": "EXATA BALANCE CO",
+      "company": "EXATA BALANCE CO",
+      "city": "Malappuram",
+      "state": "Keralam",
+      "phone": "919895251262",
+      "email": "exatabalance@gmail.com",
+      "qty": 5.0,
+      "amount": 57900.0,
+      "line_count": 4,
+      "items": [
+        "ECS with Printer",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000017031",
+      "dealer_id": 1916
+    },
+    {
+      "dealer": "ELMASS’ Weighing & Automation Pvt. Ltd",
+      "company": "ELMASS’ Weighing & Automation Pvt. Ltd",
+      "city": "ERNAKULAM",
+      "state": "Keralam",
+      "phone": "919846036922",
+      "email": "info@elmassweighing.com",
+      "qty": 5.0,
+      "amount": 48300.0,
+      "line_count": 3,
+      "items": [
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000005074017",
+      "dealer_id": 262
+    },
+    {
+      "dealer": "S&S WEIGHING SYSTEM",
+      "company": "S&S WEIGHING SYSTEM",
+      "city": "Idukki",
+      "state": "Keralam",
+      "phone": "919447743162",
+      "email": "ssweighingsystems@gmail.con",
+      "qty": 4.0,
+      "amount": 58000.0,
+      "line_count": 1,
+      "items": [
+        "ECS with Printer"
+      ],
+      "customer_id": "99381000000038015",
+      "dealer_id": 782
+    },
+    {
+      "dealer": "MICRO WEIGHING SYSTEMS",
+      "company": "MICRO WEIGHING SYSTEMS",
+      "city": "Trivandrum",
+      "state": "Keralam",
+      "phone": "919605955088",
+      "email": "microinsta@yahoo.com",
+      "qty": 4.0,
+      "amount": 50400.0,
+      "line_count": 2,
+      "items": [
+        "ECS with Printer",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000014832",
+      "dealer_id": 583
+    },
+    {
+      "dealer": "SPIDER TECHNO SOFT",
+      "company": "SPIDER TECHNO SOFT",
+      "city": "Ernakulam",
+      "state": "Keralam",
+      "phone": "919562754666",
+      "email": "arun@spidertechnosoft.com",
+      "qty": 4.0,
+      "amount": 50000.0,
+      "line_count": 2,
+      "items": [
+        "ECS 12  4W Printing scale",
+        "ECS with Printer"
+      ],
+      "customer_id": "99381000000643560",
+      "dealer_id": 934
+    },
+    {
+      "dealer": "GLOBAL DIGITAL SYSTEM",
+      "company": "GLOBAL DIGITAL SYSTEM",
+      "city": "malappuram",
+      "state": "Keralam",
+      "phone": "919744391168",
+      "email": "",
+      "qty": 4.0,
+      "amount": 49400.0,
+      "line_count": 3,
+      "items": [
+        "ECS with Printer",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000011046",
+      "dealer_id": 146
+    },
+    {
+      "dealer": "Sonic Systems",
+      "company": "Sonic Systems",
+      "city": "Palakkad",
+      "state": "Keralam",
+      "phone": "919744144510",
+      "email": "sonicsystemscpy@gmail.com",
+      "qty": 3.0,
+      "amount": 43500.0,
+      "line_count": 2,
+      "items": [
+        "ECS with Printer"
+      ],
+      "customer_id": "99381000000460001",
+      "dealer_id": 1906
+    },
+    {
+      "dealer": "Eva Scales",
+      "company": "Eva Scales",
+      "city": "Idukki",
+      "state": "Keralam",
+      "phone": "919074192546",
+      "email": "",
+      "qty": 3.0,
+      "amount": 41700.0,
+      "line_count": 2,
+      "items": [
+        "ECS with Printer",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000850389",
+      "dealer_id": 277
+    },
+    {
+      "dealer": "Minar scales -PKD",
+      "company": "Minar scales",
+      "city": "Palakkad",
+      "state": "Keralam",
+      "phone": "919349193000",
+      "email": "",
+      "qty": 3.0,
+      "amount": 28400.0,
+      "line_count": 3,
+      "items": [
+        "ELECTRONIC CASH REGISTER (BLACK)",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000004965219",
+      "dealer_id": 587
+    },
+    {
+      "dealer": "MARVEL ELECTRONICS",
+      "company": "MARVEL ELECTRONICS",
+      "city": "Thrissur",
+      "state": "Keralam",
+      "phone": "919847179343",
+      "email": "shihabthayyil@gmail.com",
+      "qty": 3.0,
+      "amount": 28000.0,
+      "line_count": 2,
+      "items": [
+        "ECS 12  4W Printing scale",
+        "ELECTRONIC CASH REGISTER (BLACK)"
+      ],
+      "customer_id": "99381000000014358",
+      "dealer_id": 552
+    },
+    {
+      "dealer": "Deepa weighing services",
+      "company": "Deepa weighing services",
+      "city": "Ernakulam",
+      "state": "Keralam",
+      "phone": "918593875050",
+      "email": "deepaweighing@gmail.com",
+      "qty": 3.0,
+      "amount": 26250.0,
+      "line_count": 2,
+      "items": [
+        "ELECTRONIC CASH REGISTER (BLACK)",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000002222998",
+      "dealer_id": 202
+    },
+    {
+      "dealer": "HAMDHA SCALES",
+      "company": "HAMDHA SCALES",
+      "city": "ERNAKULAM",
+      "state": "Keralam",
+      "phone": "919895362362",
+      "email": "",
+      "qty": 3.0,
+      "amount": 15000.0,
+      "line_count": 3,
+      "items": [
+        "ECS Additional Sales",
+        "ELECTRONIC CASH REGISTER",
+        "ELECTRONIC CASH REGISTER (BLACK)"
+      ],
+      "customer_id": "99381000002854009",
+      "dealer_id": 345
+    },
+    {
+      "dealer": "G Tech Automation",
+      "company": "G Tech Automation",
+      "city": "Kottayam",
+      "state": "Keralam",
+      "phone": "919495977119",
+      "email": "gtechautomationktm@gmail.com",
+      "qty": 2.0,
+      "amount": 31000.0,
+      "line_count": 1,
+      "items": [
+        "ECS with Printer"
+      ],
+      "customer_id": "99381000000838011",
+      "dealer_id": 295
+    },
+    {
+      "dealer": "Modern machines",
+      "company": "Modern Machine",
+      "city": "Alappuzha",
+      "state": "Keralam",
+      "phone": "919349139513",
+      "email": "sabimodernmachines@gmail.com",
+      "qty": 2.0,
+      "amount": 31000.0,
+      "line_count": 1,
+      "items": [
+        "ECS with Printer"
+      ],
+      "customer_id": "99381000000036003",
+      "dealer_id": 595
+    },
+    {
+      "dealer": "Thrass World Waynad",
+      "company": "Thrass World",
+      "city": "Waynad",
+      "state": "Keralam",
+      "phone": "919846845483",
+      "email": "",
+      "qty": 2.0,
+      "amount": 29000.0,
+      "line_count": 1,
+      "items": [
+        "ECS with Printer"
+      ],
+      "customer_id": "99381000000190230",
+      "dealer_id": 1044
+    },
+    {
+      "dealer": "PRECISE INDIA",
+      "company": "PRECISE INDIA",
+      "city": "Malapuram",
+      "state": "Keralam",
+      "phone": "919349755001",
+      "email": "manojmoothat12@gmail.com",
+      "qty": 2.0,
+      "amount": 29000.0,
+      "line_count": 1,
+      "items": [
+        "ECS with Printer"
+      ],
+      "customer_id": "99381000000011949",
+      "dealer_id": 332
+    },
+    {
+      "dealer": "MILLI MEASUREMENTS",
+      "company": "MILLI MEASUREMENTS",
+      "city": "KOZHIKODE",
+      "state": "Keralam",
+      "phone": "919656119575",
+      "email": "swjayan@gmail.com",
+      "qty": 2.0,
+      "amount": 29000.0,
+      "line_count": 1,
+      "items": [
+        "ECS with Printer"
+      ],
+      "customer_id": "99381000000014918",
+      "dealer_id": 585
+    },
+    {
+      "dealer": "SCANGLE RETAIL PRIVATE LIMITED",
+      "company": "SCANGLE RETAIL PRIVATE LIMITED",
+      "city": "Kochi",
+      "state": "Keralam",
+      "phone": "919139000888",
+      "email": "cok@scangle.in",
+      "qty": 2.0,
+      "amount": 21400.0,
+      "line_count": 2,
+      "items": [
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000001969121",
+      "dealer_id": 577
+    },
+    {
+      "dealer": "MINAR SCALES PALAKKAD",
+      "company": "MINAR SCALES PALAKKAD",
+      "city": "PALAKKAD",
+      "state": "Keralam",
+      "phone": "919349183000",
+      "email": "minarscales@gmail.com",
+      "qty": 2.0,
+      "amount": 19400.0,
+      "line_count": 1,
+      "items": [
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000003858645",
+      "dealer_id": 588
+    },
+    {
+      "dealer": "GK electronics",
+      "company": "GK electronics",
+      "city": "KOZHIKODE",
+      "state": "Keralam",
+      "phone": "918086568201",
+      "email": "kmmuhammed09@gmail.com",
+      "qty": 2.0,
+      "amount": 16950.0,
+      "line_count": 2,
+      "items": [
+        "ELECTRONIC CASH REGISTER (BLACK)",
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000161200",
+      "dealer_id": 1924
+    },
+    {
+      "dealer": "best weigh technologies",
+      "company": "best weigh technologies",
+      "city": "calicut",
+      "state": "Keralam",
+      "phone": "919744391168",
+      "email": "",
+      "qty": 1.0,
+      "amount": 11000.0,
+      "line_count": 1,
+      "items": [
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000004983332",
+      "dealer_id": 1984
+    },
+    {
+      "dealer": "JAAS ENTERPRISES",
+      "company": "JAAS ENTERPRISES",
+      "city": "Kodungallur",
+      "state": "Keralam",
+      "phone": "918089577835",
+      "email": "",
+      "qty": 1.0,
+      "amount": 10700.0,
+      "line_count": 1,
+      "items": [
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000007811111",
+      "dealer_id": 395
+    },
+    {
+      "dealer": "Weigh India",
+      "company": "Weigh India",
+      "city": "Malappuram",
+      "state": "Keralam",
+      "phone": "917012804569",
+      "email": "",
+      "qty": 1.0,
+      "amount": 9700.0,
+      "line_count": 1,
+      "items": [
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000001357054",
+      "dealer_id": 1122
+    },
+    {
+      "dealer": "V K ELECTRONICS - THAMARASSERY",
+      "company": "V K ELECTRONICS - THAMARASSERY",
+      "city": "Calicut",
+      "state": "Keralam",
+      "phone": "919544152408",
+      "email": "",
+      "qty": 1.0,
+      "amount": 9700.0,
+      "line_count": 1,
+      "items": [
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000001357416",
+      "dealer_id": 1076
+    },
+    {
+      "dealer": "GK SCALES",
+      "company": "GK SCALES",
+      "city": "Calicut",
+      "state": "Keralam",
+      "phone": "918086568201",
+      "email": "rasheedpvdr@gmail.com",
+      "qty": 1.0,
+      "amount": 9700.0,
+      "line_count": 1,
+      "items": [
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000003949894",
+      "dealer_id": 314
+    },
+    {
+      "dealer": "E WAY SOLUTIONS",
+      "company": "E WAY SOLUTIONS",
+      "city": "Palakkad",
+      "state": "Keralam",
+      "phone": "919072676703",
+      "email": "ewaysolutionsindia@gmail.com",
+      "qty": 1.0,
+      "amount": 9700.0,
+      "line_count": 1,
+      "items": [
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000601025",
+      "dealer_id": 280
+    },
+    {
+      "dealer": "ALFA SYSTEMS-KODAKARA",
+      "company": "ALFA SYSTEMS",
+      "city": "THRISSUR",
+      "state": "Keralam",
+      "phone": "919846500877",
+      "email": "kunjalanali35@gmail.com",
+      "qty": 1.0,
+      "amount": 9700.0,
+      "line_count": 1,
+      "items": [
+        "Electronic cash register"
+      ],
+      "customer_id": "99381000000017088",
+      "dealer_id": 56
+    }
+  ]
+}

@@ -198,8 +198,27 @@ function looksLikeFailedReply(text: string): boolean {
   return FAILED_REPLY_RES.some((rx) => rx.test(blob));
 }
 
+function providerFailureMessage(run: AiRun): string | null {
+  const blob = `${run.error || ""} ${run.result_summary || ""}`;
+  if (/Gemini billing blocked/i.test(blob) || /outstanding balance/i.test(blob)) {
+    return (
+      run.error?.startsWith("Gemini billing blocked")
+        ? run.error
+        : "Gemini billing blocked — pay the Google Cloud balance for the Default Gemini Project, then Retry."
+    );
+  }
+  if (/Gemini API key invalid/i.test(blob) || /api key not valid/i.test(blob)) {
+    return run.error?.startsWith("Gemini API key") ? run.error : "Gemini API key invalid — update GEMINI_API_KEY, then Retry.";
+  }
+  if (/Gemini quota exceeded/i.test(blob)) {
+    return run.error || "Gemini quota exceeded — wait or raise quota, then Retry.";
+  }
+  return null;
+}
+
 function isRetryableFailedRun(run: AiRun): boolean {
   if (run.status === "cancelled") return false;
+  if (providerFailureMessage(run)) return true;
   if (run.tool_gap) return true;
   if (run.status === "failed") return true;
   if (run.factory && run.factory.ok === false) return true;
@@ -1746,9 +1765,16 @@ export default function Work() {
               <div className="ai-thread">
                 <div className="ai-thread-scroll">
                   {(thread.runs || []).map((run) => {
+                    const providerFail = providerFailureMessage(run);
                     const failedGap = isRetryableFailedRun(run);
                     const stopped = isStoppedRun(run);
-                    const body = failedGap ? "Failed." : stopped ? "Stopped." : run.error || run.result_summary;
+                    const body = providerFail
+                      ? providerFail
+                      : failedGap
+                        ? "Failed."
+                        : stopped
+                          ? "Stopped."
+                          : run.error || run.result_summary;
                     const reportCard =
                       !failedGap && !stopped ? extractBusinessReport(run.tool_results) : null;
                     const dealerJobId =
@@ -1869,7 +1895,7 @@ export default function Work() {
                             </div>
                             {failedGap ? (
                               <div className="ai-bubble-failed">
-                                <div className="ai-bubble-text">Failed.</div>
+                                <div className="ai-bubble-text">{providerFail || "Failed."}</div>
                                 <button
                                   type="button"
                                   className="ai-retry-btn"

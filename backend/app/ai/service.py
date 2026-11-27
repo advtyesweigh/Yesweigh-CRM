@@ -3553,13 +3553,34 @@ async def _execute_run(
             )
         )
         run.status = "failed"
-        run.error = str(exc)[:2000]
+        run.error = _friendly_provider_error(str(exc))[:2000]
         run.finished_at = _now()
         run.result_summary = run.error
         add_event("error", run.error)
         run.events_json = json.dumps(events)
         await db.flush()
         return _run_out(run, events, session.public_id)
+
+
+def _friendly_provider_error(raw: str) -> str:
+    """Map Gemini/GCP provider failures to a short actionable message for the UI."""
+    text = (raw or "").strip()
+    low = text.casefold()
+    if (
+        "outstanding balance" in low
+        or ("billing account" in low and ("403" in low or "permission_denied" in low))
+        or ("permission_denied" in low and "billing" in low)
+    ):
+        return (
+            "Gemini billing blocked — Google Cloud project has an unpaid balance "
+            "(Default Gemini Project / advtyesweigh@gmail.com). "
+            "Pay or fix billing in Google Cloud Console, then Retry."
+        )
+    if "api key not valid" in low or "api_key_invalid" in low:
+        return "Gemini API key invalid — update GEMINI_API_KEY on the server, then Retry."
+    if "resource_exhausted" in low or "quota" in low and "exceed" in low:
+        return "Gemini quota exceeded — wait or raise the project quota, then Retry."
+    return text
 
 
 def _run_out(run: AiAgentRun, events: list[dict[str, Any]], session_id: str) -> dict[str, Any]:
@@ -4258,12 +4279,24 @@ def _run_dict(
     # Sanitize legacy tool-gap / max-rounds messages so the UI never re-shows them.
     from app.ai.tool_factory import looks_like_failed_reply
 
+    err_raw = (r.error or summary or "").strip()
+    provider_err = _friendly_provider_error(err_raw) if err_raw else ""
+    is_provider_billing = provider_err.startswith("Gemini billing blocked") or provider_err.startswith(
+        "Gemini API key invalid"
+    ) or provider_err.startswith("Gemini quota exceeded")
+
     tool_gap = any(
         isinstance(e, dict) and e.get("kind") == "tool_gap" for e in events
     ) or looks_like_failed_reply(summary)
     if r.status == "failed" and (not summary or looks_like_failed_reply(summary)):
         tool_gap = True
-    if tool_gap:
+    # Keep actionable provider/billing errors visible — do not collapse to generic Failed.
+    if is_provider_billing:
+        tool_gap = False
+        summary = provider_err
+        if r.error:
+            r.error = provider_err  # noqa: PLW2901 — local normalize for response only
+    elif tool_gap:
         summary = "Failed."
     if summary_limit is not None:
         summary = summary[:summary_limit]
@@ -4277,7 +4310,7 @@ def _run_dict(
         "provider": r.provider,
         "model": r.model,
         "result_summary": summary,
-        "error": r.error or None,
+        "error": (provider_err if is_provider_billing else r.error) or None,
         "events": events,
         "user_deleted": user_deleted,
         "assistant_deleted": assistant_deleted,

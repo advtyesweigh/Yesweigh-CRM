@@ -35,6 +35,8 @@ type CampaignRunItem = {
   created_at: string;
   estimated_end_at?: string;
   can_restart?: boolean;
+  can_pause?: boolean;
+  can_unpause?: boolean;
 };
 
 type SendInstance = {
@@ -107,10 +109,22 @@ function runCanRestart(run: CampaignRunItem): boolean {
   return s === "failed" || s === "stopped";
 }
 
+function runCanPause(run: CampaignRunItem): boolean {
+  if (run.can_pause === true) return true;
+  const s = (run.status || "").toLowerCase();
+  return s === "running" || s === "queued";
+}
+
+function runCanUnpause(run: CampaignRunItem): boolean {
+  if (run.can_unpause === true) return true;
+  return (run.status || "").toLowerCase() === "paused";
+}
+
 function runStatusLabel(status?: string): string {
   const s = (status || "completed").toLowerCase();
   // Live runs use an icon next to the date — no text badge.
   if (s === "running" || s === "queued") return "";
+  if (s === "paused") return "Paused";
   if (s === "failed") return "Failed";
   if (s === "stopped") return "Stopped";
   return "";
@@ -118,6 +132,7 @@ function runStatusLabel(status?: string): string {
 
 function runStatusClass(status?: string): string {
   const s = (status || "completed").toLowerCase();
+  if (s === "paused") return "camp-run-badge is-paused";
   if (s === "failed") return "camp-run-badge is-failed";
   if (s === "stopped") return "camp-run-badge is-stopped";
   return "camp-run-badge";
@@ -520,6 +535,71 @@ export default function Campaigns() {
       }
     },
     []
+  );
+
+  const onPauseRun = useCallback(
+    async (run: CampaignRunItem) => {
+      const publicId = runPublicId(run);
+      if (
+        !window.confirm(
+          `Pause campaign #${publicId ?? run.id}?\n\n` +
+            `Stops further sends. Progress (${run.success_count} success / next index) and ` +
+            `messages-per-day rate stay the same. Resume later to continue; Est. end will reschedule.`
+        )
+      ) {
+        return;
+      }
+      setActionBusyId(run.id);
+      try {
+        await api<CampaignRunItem>(`/api/campaigns/runs/${run.id}/pause`, {
+          method: "POST",
+          body: "{}",
+        });
+        showToast(`Campaign #${publicId ?? run.id} paused`);
+        await loadRuns();
+      } catch (e) {
+        showToast(e instanceof Error ? e.message : "Pause failed");
+      } finally {
+        setActionBusyId(null);
+      }
+    },
+    [loadRuns, showToast]
+  );
+
+  const onUnpauseRun = useCallback(
+    async (run: CampaignRunItem) => {
+      const publicId = runPublicId(run);
+      const remaining = Math.max(
+        0,
+        (run.total_count || 0) -
+          (run.success_count || 0) -
+          (run.failed_count || 0) -
+          (run.skipped_count || 0)
+      );
+      if (
+        !window.confirm(
+          `Resume campaign #${publicId ?? run.id}?\n\n` +
+            `Continues ~${remaining} remaining recipients from where it left off. ` +
+            `Same daily cap / quiet hours / interval. Est. end will reschedule from now.`
+        )
+      ) {
+        return;
+      }
+      setActionBusyId(run.id);
+      try {
+        await api<CampaignRunItem>(`/api/campaigns/runs/${run.id}/unpause`, {
+          method: "POST",
+          body: "{}",
+        });
+        showToast(`Campaign #${publicId ?? run.id} resumed`);
+        await loadRuns();
+      } catch (e) {
+        showToast(e instanceof Error ? e.message : "Resume failed");
+      } finally {
+        setActionBusyId(null);
+      }
+    },
+    [loadRuns, showToast]
   );
 
   const onRestartRun = useCallback(
@@ -1256,7 +1336,10 @@ export default function Campaigns() {
                       const badge = runStatusLabel(run.status);
                       const publicId = runPublicId(run);
                       const canAct = runCanRestart(run);
+                      const canPause = runCanPause(run);
+                      const canUnpause = runCanUnpause(run);
                       const busy = actionBusyId === run.id;
+                      const showActions = canAct || canPause || canUnpause;
                       return (
                         <tr
                           key={run.id}
@@ -1281,26 +1364,52 @@ export default function Campaigns() {
                                   Est. end: {fmtReportDateTime(run.estimated_end_at)}
                                 </div>
                               ) : null}
-                              {canAct ? (
+                              {showActions ? (
                                 <div className="camp-report-actions">
-                                  <button
-                                    type="button"
-                                    className="btn camp-report-action"
-                                    disabled={busy || resumeSaving}
-                                    title="Restart on the same Evolution instance after WhatsApp reconnects. Skips already-successful sends."
-                                    onClick={() => void onRestartRun(run)}
-                                  >
-                                    {busy ? "…" : "Restart"}
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="btn camp-report-action"
-                                    disabled={busy || resumeSaving}
-                                    title="Continue remaining recipients on a different Evolution / WhatsApp number (e.g. after 24h block)."
-                                    onClick={() => void openResumeModal(run)}
-                                  >
-                                    Resume on new instance
-                                  </button>
+                                  {canPause ? (
+                                    <button
+                                      type="button"
+                                      className="btn camp-report-action"
+                                      disabled={busy || resumeSaving}
+                                      title="Pause sending. Keeps progress and messages-per-day rate; Est. end reschedules on Resume."
+                                      onClick={() => void onPauseRun(run)}
+                                    >
+                                      {busy ? "…" : "Pause"}
+                                    </button>
+                                  ) : null}
+                                  {canUnpause ? (
+                                    <button
+                                      type="button"
+                                      className="btn camp-report-action"
+                                      disabled={busy || resumeSaving}
+                                      title="Continue from where it left off. Same daily cap / quiet hours / interval; Est. end reschedules from now."
+                                      onClick={() => void onUnpauseRun(run)}
+                                    >
+                                      {busy ? "…" : "Resume"}
+                                    </button>
+                                  ) : null}
+                                  {canAct ? (
+                                    <>
+                                      <button
+                                        type="button"
+                                        className="btn camp-report-action"
+                                        disabled={busy || resumeSaving}
+                                        title="Restart on the same Evolution instance after WhatsApp reconnects. Skips already-successful sends."
+                                        onClick={() => void onRestartRun(run)}
+                                      >
+                                        {busy ? "…" : "Restart"}
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="btn camp-report-action"
+                                        disabled={busy || resumeSaving}
+                                        title="Continue remaining recipients on a different Evolution / WhatsApp number (e.g. after 24h block)."
+                                        onClick={() => void openResumeModal(run)}
+                                      >
+                                        Resume on new instance
+                                      </button>
+                                    </>
+                                  ) : null}
                                 </div>
                               ) : null}
                             </div>

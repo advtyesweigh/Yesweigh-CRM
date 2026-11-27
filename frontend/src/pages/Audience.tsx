@@ -140,6 +140,10 @@ export default function Audience() {
     if (form.state.trim()) filters.state = form.state.trim();
     if (form.city.trim()) filters.city = form.city.trim();
     if (form.district.trim()) filters.district = form.district.trim();
+    // Preserve static phone-list filters when editing via geo-only UI
+    if (editing?.filters?.phones) {
+      filters.phones = editing.filters.phones;
+    }
 
     setSaving(true);
     setSaveError("");

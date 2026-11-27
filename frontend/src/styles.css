@@ -6633,6 +6633,10 @@ button.ml-stat--filter:focus-visible {
   background: #ffedd5;
   color: #c2410c;
 }
+.camp-run-badge.is-paused {
+  background: #e0e7ff;
+  color: #3730a3;
+}
 .camp-report-actions {
   display: flex;
   flex-direction: column;
